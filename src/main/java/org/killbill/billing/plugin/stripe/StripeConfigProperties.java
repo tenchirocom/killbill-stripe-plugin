@@ -45,6 +45,9 @@ import com.stripe.net.RequestOptions.RequestOptionsBuilder;
 public class StripeConfigProperties {
 
     private static final String PROPERTY_PREFIX = "org.killbill.billing.plugin.stripe.";
+    
+    // Stripe webhook signature verification
+    private static final String PROPERTY_WEBHOOK_SECRET = PROPERTY_PREFIX + "webhookSecret";
 
     private static final SSLSocketFactory DEFAULT_SSL_SOCKET_FACTORY = HttpsURLConnection.getDefaultSSLSocketFactory();
     private static final HostnameVerifier DEFAULT_HOSTNAME_VERIFIER = HttpsURLConnection.getDefaultHostnameVerifier();
@@ -74,6 +77,8 @@ public class StripeConfigProperties {
     private final String chargeDescription;
     private final String chargeStatementDescriptor;
     private final boolean cancelOn3DSAuthorizationFailure;
+    // Stripe signature verification
+    private final String webhookSecret;
 
     public StripeConfigProperties(final Properties properties, final String region) {
         this.region = region;
@@ -90,6 +95,11 @@ public class StripeConfigProperties {
         this.chargeDescription = Ascii.truncate(MoreObjects.firstNonNull(properties.getProperty(PROPERTY_PREFIX + "chargeDescription"), "Kill Bill charge"), 22, "...");
         this.chargeStatementDescriptor = Ascii.truncate(MoreObjects.firstNonNull(properties.getProperty(PROPERTY_PREFIX + "chargeStatementDescriptor"), "Kill Bill charge"), 22, "...");
         this.cancelOn3DSAuthorizationFailure = readCancelOn3DSAuthorizationFailure(properties);
+        this.webhookSecret = StripeConfigPropertyResolver.resolve(properties.getProperty(PROPERTY_WEBHOOK_SECRET));
+    }
+
+    public String getWebhookSecret() {
+        return webhookSecret;
     }
 
     public String getApiKey() {

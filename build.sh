@@ -10,7 +10,7 @@ echo "🚀 Building Killbill Plugin..."
 # Clean and build the JAR
 mvn clean package -DskipTests -q
 
-JAR_FILE="target/killbill-stripe-plugin-1.0.0.jar"
+JAR_FILE="target/stripe-plugin-8.0.5-SNAPSHOT.jar"
 
 if [ -f "$JAR_FILE" ]; then
     echo "✅ Build successful!"

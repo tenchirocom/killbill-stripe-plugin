@@ -61,25 +61,19 @@ public class StripeHealthcheck implements Healthcheck {
     private HealthStatus pingStripe(final StripeConfigProperties stripeConfigProperties) {
         final RequestOptions requestOptions = stripeConfigProperties.toRequestOptions();
 
-        // Found this endpoint by cURLing random urls - let's hope it's stable :-)
-        final String url = String.format("%s%s", Stripe.getApiBase(), "/healthcheck");
         try {
-            ApiResource.request(ApiResource.RequestMethod.GET,
-                                url,
-                                ImmutableMap.<String, Object>of(),
-                                StripeHealthcheckResponse.class,
-                                requestOptions);
+            // Standard API call to verify connectivity and credentials.
+            // This is the most reliable way to check if your Stripe integration is "Healthy".
+            com.stripe.model.Balance.retrieve(requestOptions);
             return HealthStatus.healthy("Stripe OK");
-        } catch (final ApiException e) { // Not a JSON object anymore...
-            if (e.getStatusCode() == 200) {
-                return HealthStatus.healthy("Stripe OK");
-            } else {
-                logger.warn("Healthcheck error", e);
-                return HealthStatus.unHealthy("Stripe error: " + e.getMessage());
-            }
         } catch (final StripeException e) {
-            logger.warn("Healthcheck error", e);
+            // If Stripe returns an error (like 401 Unauthorized), the plugin configuration is invalid.
+            logger.warn("Stripe Healthcheck failed", e);
             return HealthStatus.unHealthy("Stripe error: " + e.getMessage());
+        } catch (final Exception e) {
+            // Catch-all for unexpected issues (network, etc.)
+            logger.error("Unexpected Healthcheck error", e);
+            return HealthStatus.unHealthy("Internal error: " + e.getMessage());
         }
     }
 

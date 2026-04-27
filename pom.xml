@@ -26,8 +26,8 @@
     <artifactId>stripe-plugin</artifactId>
     <version>8.0.5-SNAPSHOT</version>
     <packaging>bundle</packaging>
-    <name>Kill Bill Stripe plugin</name>
-    <description>Kill Bill Stripe plugin</description>
+    <name>Kill Bill Stripe (JA) plugin</name>
+    <description>Kill Bill Stripe (JA) plugin. Includes Japanese market methods: bank_transfer and konbini.</description>
     <url>http://github.com/killbill/killbill-stripe-plugin</url>
     <scm>
         <connection>scm:git:git://github.com/killbill/killbill-stripe-plugin.git</connection>
@@ -99,7 +99,7 @@
         <dependency>
             <groupId>com.stripe</groupId>
             <artifactId>stripe-java</artifactId>
-            <version>21.15.0</version>
+            <version>26.0.0</version>
         </dependency>
         <dependency>
             <groupId>io.zonky.test</groupId>
