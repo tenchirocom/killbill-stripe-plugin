@@ -32,6 +32,7 @@ import javax.sql.DataSource;
 import org.joda.time.DateTime;
 import org.jooq.DSLContext;
 import org.jooq.impl.DSL;
+import org.jooq.SQLDialect;
 import org.killbill.billing.catalog.api.Currency;
 import org.killbill.billing.payment.api.PluginProperty;
 import org.killbill.billing.payment.api.TransactionType;
@@ -327,5 +328,26 @@ public class StripeDao extends PluginPaymentDao<StripeResponsesRecord, StripeRes
         } catch (final IOException e) {
             throw new RuntimeException(e);
         }
+    }
+
+    /**
+     * Used by the webhook handler to find a response record by Stripe PaymentIntent ID.
+     */
+    public StripeResponsesRecord getResponseByStripeId(final String stripeId, final UUID tenantId) throws SQLException {
+        if (stripeId == null || tenantId == null) {
+            return null;
+        }
+
+        return execute(dataSource.getConnection(),
+                       new WithConnectionCallback<StripeResponsesRecord>() {
+                           @Override
+                           public StripeResponsesRecord withConnection(final Connection conn) throws SQLException {
+                               return DSL.using(conn, dialect, settings)
+                                         .selectFrom(STRIPE_RESPONSES)
+                                         .where(STRIPE_RESPONSES.STRIPE_ID.equal(stripeId))
+                                         .and(STRIPE_RESPONSES.KB_TENANT_ID.equal(tenantId.toString()))
+                                         .fetchOne();
+                           }
+                       });
     }
 }

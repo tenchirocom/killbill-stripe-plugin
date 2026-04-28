@@ -265,11 +265,18 @@ public final class StripeMethodExtensions {
      */
     public static Map<String, Object> buildStoredMethodData(
         final String singleUseType,
-        final Iterable<PluginProperty> properties
+        final Iterable<PluginProperty> properties,
+        final RequestOptions requestOptions,
+        final String customer_id
     ) {
         final Map<String, Object> data = new HashMap<>();
         // Always store the type so getSingleUseType(Map) can detect it later.
         data.put(SINGLE_USE_TYPE, singleUseType);
+        data.put("type", singleUseType);
+        data.put("object", "payment_method");
+        data.put("customer_id", customer_id);
+        data.put("livemode", isLiveMode(requestOptions.getApiKey()));
+        data.put("created", System.currentTimeMillis() / 1000);
 
         if ("konbini".equals(singleUseType)) {
             // Required
@@ -312,6 +319,16 @@ public final class StripeMethodExtensions {
         }
 
         return data;
+    }
+
+    /**
+     * Determines if the Stripe API key belongs to a live account.
+     */
+    private static boolean isLiveMode(final String apiKey) {
+        if (apiKey == null) {
+            return false;
+        }
+        return apiKey.startsWith("sk_live_") || apiKey.startsWith("rk_live_") || apiKey.startsWith("pk_live_");
     }
 
     // -----------------------------------------------------------------------

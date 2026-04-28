@@ -14,6 +14,19 @@
  * License for the specific language governing permissions and limitations
  * under the License.
  */
+
+/*
+ ***********************************************************************************
+ * Killbill Configuration Required (for Stripe webhook signature verification)
+ *
+ * The following configuration must be added to the killbill configuration
+ *  org.killbill.billing.plugin.stripe.webhookSecret=whsec_xxxxxxxxxxxxxxxxxxxxxxxx
+ * 
+ * The single-use method expiration values can be set with:
+ *  org.killbill.billing.plugin.stripe.pendingPaymentExpirationPeriod=konbini#P3d|bank_transfer#P4d
+ ***********************************************************************************
+ */
+
 package org.killbill.billing.plugin.stripe;
 
 import java.net.InetSocketAddress;
@@ -54,6 +67,8 @@ public class StripeConfigProperties {
     private static final String DEFAULT_API_BASE = Stripe.getApiBase();
 
     public static final String DEFAULT_PENDING_PAYMENT_EXPIRATION_PERIOD = "P3d";
+    // Supported keys for per-method overrides (see ExpiredPaymentPolicy#getPaymentMethod):
+    //   konbini, bank_transfer, card, sepa_debit, us_bank_account, ...
     public static final String DEFAULT_PENDING_3DS_PAYMENT_EXPIRATION_PERIOD = "PT3h";
     public static final String DEFAULT_PENDING_HPP_PAYMENT_WITHOUT_COMPLETION_EXPIRATION_PERIOD = "PT1h";
 
@@ -95,6 +110,7 @@ public class StripeConfigProperties {
         this.chargeDescription = Ascii.truncate(MoreObjects.firstNonNull(properties.getProperty(PROPERTY_PREFIX + "chargeDescription"), "Kill Bill charge"), 22, "...");
         this.chargeStatementDescriptor = Ascii.truncate(MoreObjects.firstNonNull(properties.getProperty(PROPERTY_PREFIX + "chargeStatementDescriptor"), "Kill Bill charge"), 22, "...");
         this.cancelOn3DSAuthorizationFailure = readCancelOn3DSAuthorizationFailure(properties);
+        // Stripe webhook signature verification
         this.webhookSecret = StripeConfigPropertyResolver.resolve(properties.getProperty(PROPERTY_WEBHOOK_SECRET));
     }
 
@@ -191,6 +207,15 @@ public class StripeConfigProperties {
         final String pendingExpirationPeriods = properties.getProperty(PROPERTY_PREFIX + "pendingPaymentExpirationPeriod");
         final Map<String, String> paymentMethodToExpirationPeriodString = new HashMap<String, String>();
         refillMap(paymentMethodToExpirationPeriodString, pendingExpirationPeriods);
+
+        // === ONLY inject our code-level defaults when NO configuration was provided at all ===
+        // This way a global setting (P7d) still overrides everything, as originally intended.
+        if (pendingExpirationPeriods == null) {
+            // No config line at all → apply sensible defaults for the new single-use methods
+            paymentMethodToExpirationPeriodString.put("konbini", "P3d");
+            paymentMethodToExpirationPeriodString.put("bank_transfer", "P4d");
+        }
+
         // No per-payment method override, just a global setting
         if (pendingExpirationPeriods != null && paymentMethodToExpirationPeriodString.isEmpty()) {
             try {
@@ -198,7 +223,7 @@ public class StripeConfigProperties {
             } catch (final IllegalArgumentException e) { /* Ignore */ }
         }
 
-        // User has defined per-payment method overrides
+        // User has defined per-payment method overrides (or we just added the defaults above)
         for (final Entry<String, String> entry : paymentMethodToExpirationPeriodString.entrySet()) {
             try {
                 paymentMethodToExpirationPeriod.put(entry.getKey().toLowerCase(), Period.parse(entry.getValue()));

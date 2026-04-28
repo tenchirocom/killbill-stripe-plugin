@@ -31,12 +31,27 @@ public class StripePaymentMethodPlugin extends PluginPaymentMethodPlugin {
 
     public static StripePaymentMethodPlugin build(final StripePaymentMethodsRecord stripePaymentMethodsRecord) {
         final Map additionalData = StripeDao.fromAdditionalData(stripePaymentMethodsRecord.getAdditionalData());
-        final String externalPaymentMethodId = (String) additionalData.get("id");
+        String externalPaymentMethodId = (String) additionalData.get("id");
 
-        return new StripePaymentMethodPlugin(UUID.fromString(stripePaymentMethodsRecord.getKbPaymentMethodId()),
-                                             externalPaymentMethodId,
-                                             stripePaymentMethodsRecord.getIsDefault() == StripeDao.TRUE,
-                                             PluginProperties.buildPluginProperties(additionalData));
+        // Inject key fields for single-use methods so they look consistent with cards
+        if (StripeMethodExtensions.isSingleUseStripeId(stripePaymentMethodsRecord.getStripeId())) {
+            additionalData.putIfAbsent("object", "payment_method");
+            additionalData.putIfAbsent("type", StripeMethodExtensions.getSingleUseType(additionalData));
+            additionalData.putIfAbsent("id", stripePaymentMethodsRecord.getStripeId());           // sentinel
+            additionalData.putIfAbsent("livemode", false);   // can be improved later
+            additionalData.putIfAbsent("created", System.currentTimeMillis() / 1000);
+            
+            // Use the sentinel as external ID if none exists
+            if (externalPaymentMethodId == null) {
+                externalPaymentMethodId = stripePaymentMethodsRecord.getStripeId();
+            }
+        }
+
+        return new StripePaymentMethodPlugin(
+                UUID.fromString(stripePaymentMethodsRecord.getKbPaymentMethodId()),
+                externalPaymentMethodId,
+                stripePaymentMethodsRecord.getIsDefault() == StripeDao.TRUE,
+                PluginProperties.buildPluginProperties(additionalData));
     }
 
     public StripePaymentMethodPlugin(final UUID kbPaymentMethodId,

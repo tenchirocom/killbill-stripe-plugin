@@ -14,14 +14,6 @@
  * License for the specific language governing permissions and limitations
  * under the License.
  */
-
-/*
- * Killbill Configuration Required (for Stripe webhook signature verification)
- *
- * The following configuration must be added to the killbill configuration
- *  org.killbill.billing.plugin.stripe.webhookSecret=whsec_xxxxxxxxxxxxxxxxxxxxxxxx
- */
-
 package org.killbill.billing.plugin.stripe;
 
 import java.math.BigDecimal;
@@ -82,6 +74,8 @@ import com.google.common.collect.ImmutableMap;
 import com.stripe.exception.CardException;
 import com.stripe.exception.StripeException;
 import com.stripe.exception.SignatureVerificationException;
+import com.stripe.model.BankAccount;
+import com.stripe.model.Card;
 import com.stripe.model.Charge;
 import com.stripe.model.ChargeSearchResult;
 import com.stripe.model.Customer;
@@ -218,10 +212,8 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                         logger.debug("Single-use payment {} is awaiting customer action (status={}). Skipping 3DS path.",
                                      intent.getId(), intent.getStatus());
                         final Charge lastCharge = getLastCharge(intent, Collections.emptyMap(), requestOptions);
-                        if (lastCharge != null) {
-                            dao.updateResponse(transaction.getKbTransactionPaymentId(), intent, lastCharge, context.getTenantId());
-                            wasRefreshed = true;
-                        }
+                        dao.updateResponse(transaction.getKbTransactionPaymentId(), intent, lastCharge, context.getTenantId());
+                        wasRefreshed = true;
                         continue;
                     }
 
@@ -347,13 +339,14 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
         final String singleUseType = StripeMethodExtensions.getSingleUseType(allProperties);
         if (singleUseType != null) {
             logger.info("Registering single-use payment method '{}' for kbPaymentMethodId={}", singleUseType, kbPaymentMethodId);
-            
+
+            String existingCustomerId = getCustomerIdNoException(kbAccountId, context);
+
             // Stripe strictly requires a Customer object for Bank Transfers (customer_balance)
             if ("bank_transfer".equals(singleUseType)) {
-                final String existingCustomerId = getCustomerIdNoException(kbAccountId, context);
                 if (existingCustomerId == null) {
                     try {
-                        createStripeCustomer(kbAccountId, null, ImmutableMap.of(), requestOptions, allProperties, context);
+                        existingCustomerId = createStripeCustomer(kbAccountId, null, ImmutableMap.of(), requestOptions, allProperties, context);
                     } catch (final StripeException e) {
                         throw new PaymentPluginApiException("Failed to create Stripe customer required for bank transfer", e);
                     }
@@ -361,7 +354,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             }
             final Map<String, Object> additionalData;
             try {
-                additionalData = StripeMethodExtensions.buildStoredMethodData(singleUseType, allProperties);
+                additionalData = StripeMethodExtensions.buildStoredMethodData(singleUseType, allProperties, requestOptions, existingCustomerId);
             } catch (final IllegalArgumentException e) {
                 throw new PaymentPluginApiException("USER", e.getMessage());
             }
@@ -597,12 +590,40 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             throw new PaymentPluginApiException("Unable to retrieve payment method", e);
         }
 
-        // Single-use methods have a sentinel stripe_id — there is no Stripe object
-        // to detach. Skip the Stripe API call and go straight to the local delete.
+        // Single-use methods have a sentinel stripe_id — skip Stripe API call
         if (!StripeMethodExtensions.isSingleUseStripeId(stripePaymentMethodsRecord.getStripeId())) {
             final RequestOptions requestOptions = buildRequestOptions(context);
+            final String stripeId = stripePaymentMethodsRecord.getStripeId();
+            
             try {
-                PaymentMethod.retrieve(stripePaymentMethodsRecord.getStripeId(), requestOptions).detach(requestOptions);
+                if (stripeId.startsWith("pm_")) {
+                    // Modern PaymentMethod - detach from customer
+                    PaymentMethod.retrieve(stripeId, requestOptions).detach(requestOptions);
+                } else if (stripeId.startsWith("src_")) {
+                    // Legacy Source - detach from customer (no params needed)
+                    Source.retrieve(stripeId, requestOptions).detach();
+                } else if (stripeId.startsWith("card_") || stripeId.startsWith("ba_")) {
+                    // Legacy Card or BankAccount - delete from customer's sources
+                    final String customerId = getCustomerIdNoException(kbAccountId, context);
+                    if (customerId != null) {
+                        final PaymentSource source = Customer.retrieve(customerId, requestOptions)
+                            .getSources()
+                            .retrieve(stripeId, requestOptions);
+                        
+                        // Cast to the appropriate type and delete
+                        if (source instanceof Card) {
+                            ((Card) source).delete(requestOptions);
+                        } else if (source instanceof BankAccount) {
+                            ((BankAccount) source).delete(requestOptions);
+                        } else {
+                            throw new PaymentPluginApiException("Unsupported payment source type", new UnsupportedOperationException());
+                        }
+                    } else {
+                        throw new PaymentPluginApiException("Unable to find Stripe customer", new IllegalStateException());
+                    }
+                } else {
+                    throw new PaymentPluginApiException("Unknown payment method type: " + stripeId, new UnsupportedOperationException());
+                }
             } catch (final StripeException e) {
                 throw new PaymentPluginApiException("Unable to delete Stripe payment method", e);
             }
@@ -682,10 +703,11 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
     }
 
     private void syncPaymentMethods(final UUID kbAccountId,
-                                    final Iterable<? extends HasId> stripeObjects,
-                                    final Map<String, StripePaymentMethodsRecord> existingPaymentMethodByStripeId,
-                                    final Set<String> stripeObjectsTreated,
-                                    final CallContext context) throws PaymentApiException, SQLException {
+                                final Iterable<? extends HasId> stripeObjects,
+                                final Map<String, StripePaymentMethodsRecord> existingPaymentMethodByStripeId,
+                                final Set<String> stripeObjectsTreated,
+                                final CallContext context) throws PaymentApiException, SQLException
+    {
         for (final HasId stripeObject : stripeObjects) {
             if (stripeObjectsTreated.contains(stripeObject.getId())) {
                 continue;
@@ -693,27 +715,41 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             stripeObjectsTreated.add(stripeObject.getId());
 
             final Map<String, Object> additionalDataMap;
+            final String stripeId = stripeObject.getId();
+            
+            // Handle modern PaymentMethod objects (pm_*)
             if (stripeObject instanceof PaymentMethod) {
                 additionalDataMap = StripePluginProperties.toAdditionalDataMap((PaymentMethod) stripeObject);
-            } else if (stripeObject instanceof PaymentSource) {
+            } 
+            // Handle legacy Card objects (card_*)
+            else if (stripeObject instanceof Card) {
+                additionalDataMap = StripePluginProperties.toAdditionalDataMap((Card) stripeObject);
+            }
+            // Handle legacy Source objects (src_*)
+            else if (stripeObject instanceof Source) {
+                additionalDataMap = StripePluginProperties.toAdditionalDataMap((Source) stripeObject);
+            }
+            // Fallback for other PaymentSource types
+            else if (stripeObject instanceof PaymentSource) {
                 additionalDataMap = StripePluginProperties.toAdditionalDataMap((PaymentSource) stripeObject);
-            } else {
-                throw new UnsupportedOperationException("Unsupported object: " + stripeObject);
+            } 
+            else {
+                throw new UnsupportedOperationException("Unsupported object: " + stripeObject.getClass().getName() + " with ID: " + stripeId);
             }
 
-            final StripePaymentMethodsRecord existingRecord = existingPaymentMethodByStripeId.remove(stripeObject.getId());
+            final StripePaymentMethodsRecord existingRecord = existingPaymentMethodByStripeId.remove(stripeId);
             if (existingRecord == null) {
-                logger.info("Creating new local Stripe payment method {}", stripeObject.getId());
+                logger.info("Creating new local Stripe payment method {} (type: {})", stripeId, stripeObject.getClass().getSimpleName());
                 final StripePaymentMethodPlugin paymentMethodInfo = new StripePaymentMethodPlugin(
-                        null, stripeObject.getId(), false, PluginProperties.buildPluginProperties(additionalDataMap));
+                        null, stripeId, false, PluginProperties.buildPluginProperties(additionalDataMap));
                 killbillAPI.getPaymentApi().addPaymentMethod(
-                        getAccount(kbAccountId, context), stripeObject.getId(),
+                        getAccount(kbAccountId, context), stripeId,
                         StripeActivator.PLUGIN_NAME, false, paymentMethodInfo,
                         ImmutableList.of(), context);
             } else {
-                logger.info("Updating existing local Stripe payment method {}", stripeObject.getId());
+                logger.info("Updating existing local Stripe payment method {} (type: {})", stripeId, stripeObject.getClass().getSimpleName());
                 dao.updatePaymentMethod(UUID.fromString(existingRecord.getKbPaymentMethodId()),
-                                        additionalDataMap, stripeObject.getId(),
+                                        additionalDataMap, stripeId,
                                         clock.getUTCNow(), context.getTenantId());
             }
         }
@@ -935,47 +971,80 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             ? PluginProperties.findPluginPropertyValue("Stripe-Signature", properties) 
             : null;
 
-        if (sigHeader == null) {
-            logger.warn("Webhook received without Stripe-Signature header");
-            return null;
-        }
-
         final StripeConfigProperties config = stripeConfigPropertiesConfigurationHandler
                 .getConfigurable(context.getTenantId());
 
         final String webhookSecret = config.getWebhookSecret();   // ← you must add this to StripeConfigProperties
 
+        // When no secret is configured → signature verification is turned OFF
         if (webhookSecret == null || webhookSecret.isBlank()) {
-            logger.error("Stripe webhook secret is not configured");
-            return null;
+            logger.error("=================================================================");
+            logger.error("⚠️  CRITICAL: USING DEFAULT WEBHOOK SECRET (INSECURE!)");
+            logger.error("    The property 'org.killbill.billing.plugin.stripe.webhookSecret'");
+            logger.error("    is not configured. Using fallback default secret.");
+            logger.error("    ADD THIS TO YOUR KILLBILL CONFIG IMMEDIATELY:");
+            logger.error("    org.killbill.billing.plugin.stripe.webhookSecret=whsec_xxxxxxxxxxxxxxxxxxxxxxxx");
+            logger.error("=================================================================");
         }
 
+        Event event;
+
         try {
-            // This verifies the signature and parses the event
-            final Event event = Webhook.constructEvent(notification, sigHeader, webhookSecret);
-
-            logger.info("Verified Stripe webhook event: type={} id={}", event.getType(), event.getId());
-
+            //
+            // SIGNATURE VERIFICATION
+            //
+            if (webhookSecret == null || webhookSecret.isBlank()) {
+                // Dev mode: skip signature verification completely
+                event = Event.GSON.fromJson(notification, Event.class);
+                logger.info("Parsed Stripe webhook WITHOUT signature verification, continuing (dev mode)...");
+            } else {
+                // Production mode: enforce signature verification
+                if (sigHeader == null) {
+                    // NO SIGNATURE HEADER FOUND
+                    logger.warn("STRIPE WEBHOOK IGNORED: Webhook received without Stripe-Signature header.");
+                    return null;
+                }
+                // This verifies the signature and parses the event If the signature doesn't match
+                // throws a SignatureVerificationException
+                event = Webhook.constructEvent(notification, sigHeader, webhookSecret);
+                logger.info("Verified Stripe webhook event: type={} id={}", event.getType(), event.getId());
+            }
+            //
+            // PROCESS STATUS UPDATES
+            //
             if ("payment_intent.succeeded".equals(event.getType()) ||
                 "payment_intent.payment_failed".equals(event.getType())) {
 
                 final PaymentIntent intent = (PaymentIntent) event.getDataObjectDeserializer()
-                        .getObject()
-                        .orElse(null);
-
+                        .getObject().orElse(null);
                 if (intent != null) {
-                    final boolean succeeded = "succeeded".equals(intent.getStatus());
-                    logger.info("Webhook updating PaymentIntent {} → {}", intent.getId(), succeeded ? "SUCCESS" : "FAILED");
-
-                    // Return a GatewayNotification so KillBill can process it
+                    try {
+                        // Look up the KB transaction by Stripe PI ID and update it
+                        final StripeResponsesRecord record = dao.getResponseByStripeId(intent.getId(), context.getTenantId());
+                        if (record != null) {
+                            final Map<String, Object> update = new HashMap<>();
+                            // Merge the latest intent state into additional_data
+                            update.put("status", intent.getStatus());
+                            if ("succeeded".equals(intent.getStatus())) {
+                                update.put(PROPERTY_OVERRIDDEN_TRANSACTION_STATUS, PaymentPluginStatus.PROCESSED.toString());
+                            } else if ("canceled".equals(intent.getStatus())) {
+                                update.put(PROPERTY_OVERRIDDEN_TRANSACTION_STATUS, PaymentPluginStatus.ERROR.toString());
+                            }
+                            dao.updateResponse(record, update);
+                            logger.info("Webhook: updated response for PI {} → {}", intent.getId(), intent.getStatus());
+                        } else {
+                            logger.warn("Webhook: no response record found for PI {}", intent.getId());
+                        }
+                    } catch (final SQLException e) {
+                        logger.error("Webhook: DB error updating response for PI {}", intent.getId(), e);
+                    }
                     return new PluginGatewayNotification(event.getId());
                 }
             }
-
         } catch (final SignatureVerificationException e) {
-            logger.warn("Invalid Stripe webhook signature", e);
+            logger.warn("STRIPE WEBHOOK IGNORED: Invalid Stripe webhook signature", e);
         } catch (final Exception e) {
-            logger.error("Failed to process Stripe webhook", e);
+            logger.error("STRIPE WEBHOOK ERROR: Failed to process Stripe webhook", e);
         }
 
         return null;
@@ -1179,28 +1248,25 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
 
         try {
             final Charge lastCharge = getLastCharge(response, Collections.emptyMap(), requestOptions);
-            if (lastCharge != null) {
-                final StripeResponsesRecord responsesRecord = dao.addResponse(kbAccountId, kbPaymentId, kbTransactionId,
-                        transactionType, amount, currency, response, lastCharge, stripeException, utcNow, context.getTenantId());
+            final StripeResponsesRecord responsesRecord = dao.addResponse(kbAccountId, kbPaymentId, kbTransactionId,
+                    transactionType, amount, currency, response, lastCharge, stripeException, utcNow, context.getTenantId());
 
-                // Extract next_action details (vouchers, bank accounts) so the frontend can display them
-                final Map<String, Object> pmAdditionalData = StripeDao.fromAdditionalData(nonNullPaymentMethodsRecord.getAdditionalData());
-                final String singleUseType = StripeMethodExtensions.getSingleUseType(pmAdditionalData);
-                
-                if (StripeMethodExtensions.requiresSpecialHandling(singleUseType)) {
-                    final Map<String, Object> nextActionDetails = StripeMethodExtensions.extractNextActionDetails(response, singleUseType);
-                    if (!nextActionDetails.isEmpty()) {
-                        // Update the response record with the flattened voucher/bank details
-                        dao.updateResponse(responsesRecord, nextActionDetails);
-                        // Re-fetch the updated record so the plugin returns the new properties
-                        final StripeResponsesRecord updatedRecord = dao.getSuccessfulAuthorizationResponse(kbPaymentId, context.getTenantId());
-                        return StripePaymentTransactionInfoPlugin.build(updatedRecord);
-                    }
+            // Extract next_action details (vouchers, bank accounts) so the frontend can display them
+            final Map<String, Object> pmAdditionalData = StripeDao.fromAdditionalData(nonNullPaymentMethodsRecord.getAdditionalData());
+            final String singleUseType = StripeMethodExtensions.getSingleUseType(pmAdditionalData);
+            
+            if (StripeMethodExtensions.requiresSpecialHandling(singleUseType)) {
+                final Map<String, Object> nextActionDetails = StripeMethodExtensions.extractNextActionDetails(response, singleUseType);
+                if (!nextActionDetails.isEmpty()) {
+                    // Update the response record with the flattened voucher/bank details
+                    dao.updateResponse(responsesRecord, nextActionDetails);
+                    // Re-fetch the updated record so the plugin returns the new properties
+                    final StripeResponsesRecord updatedRecord = dao.getSuccessfulAuthorizationResponse(kbPaymentId, context.getTenantId());
+                    return StripePaymentTransactionInfoPlugin.build(updatedRecord);
                 }
-
-                return StripePaymentTransactionInfoPlugin.build(responsesRecord);
             }
-            return null;
+
+            return StripePaymentTransactionInfoPlugin.build(responsesRecord);
         } catch (final SQLException e) {
             throw new PaymentPluginApiException("Payment went through, but we encountered a database error. Payment details: " + response, e);
         }

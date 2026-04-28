@@ -17,7 +17,7 @@ if [ -f "$JAR_FILE" ]; then
     echo "📦 Plugin JAR created: $JAR_FILE"
     echo ""
     echo "📍 Next step: Deploy the JAR to KillBill"
-    echo "   cp $JAR_FILE /var/lib/killbill/bundles/plugins/java/__OFFLINE_PAYMENT__/"
+    echo "   cp $JAR_FILE /var/lib/killbill/bundles/plugins/java/stripe-plugin/8.0.5/"
 else
     echo "❌ Build failed - JAR not found"
     exit 1

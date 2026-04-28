@@ -101,7 +101,20 @@ public class ExpiredPaymentPolicy {
 
     private boolean is3ds(final Map stripeResponseAdditionalData) {
         // See https://stripe.com/docs/payments/payment-intents/status
-        return "requires_action".equals(stripeResponseAdditionalData.get("status"));
+        if (!"requires_action".equals(stripeResponseAdditionalData.get("status"))) {
+            return false;
+        }
+        // Single-use methods also have requires_action but are NOT 3DS.
+        // Detect by payment_method_types stored in additional_data.
+        final Object pmTypes = stripeResponseAdditionalData.get("payment_method_types");
+        if (pmTypes instanceof List) {
+            final List<?> types = (List<?>) pmTypes;
+            if (types.contains("konbini") || types.contains("customer_balance")) {
+                // Exclude konbini and customer_balance from being classified as 3ds
+                return false; // awaiting customer payment, not 3DS
+            }
+        }
+        return true;
     }
 
     private boolean isHppCompletionTransaction(final Map stripeResponseAdditionalData) {
@@ -113,6 +126,14 @@ public class ExpiredPaymentPolicy {
     }
 
     private String getPaymentMethod(final Map stripeResponseAdditionalData) {
+        // Single-use methods (konbini / bank_transfer) store their type in additional_data
+        // via StripeMethodExtensions. Use it first so the per-method config works.
+        final String singleUseType = StripeMethodExtensions.getSingleUseType(stripeResponseAdditionalData);
+        if (singleUseType != null) {
+            return singleUseType;   // returns "konbini" or "bank_transfer" — exactly matches config keys
+        }
+
+        // Normal card / SEPA / US bank account path (unchanged)
         return (String) stripeResponseAdditionalData.get("last_charge_payment_method_type");
     }
 }
