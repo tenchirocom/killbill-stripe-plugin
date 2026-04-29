@@ -29,15 +29,24 @@ docker exec killbill kpm install_java_plugin killbill-stripe \
 echo "🔄 Restarting Kill Bill..."
 docker restart killbill
 
-echo "⏳ Waiting for container to restart..."
-sleep 5
+echo "⏳ Waiting for killbill container to finish starting..."
 
-echo "📋 Current status:"
-docker ps -f "name=^killbill$" --format "table {{.Names}}\t{{.Status}}\t{{.ID}}"
+while true; do
+    STATUS=$(docker ps -f "name=^killbill$" --format "{{.Status}}")
+    
+    if [[ "$STATUS" != *"(health: starting)"* ]]; then
+        echo 
+        echo "=================================================================="
+        echo "Killbill started."
+        echo "📋 Current status:"
+        docker ps -f "name=^killbill$" --format "table {{.Names}}\t{{.Status}}\t{{.ID}}"
+        echo "=================================================================="
+        echo "Done."
+        break
+    fi
+    echo -n "."
+    sleep 5
+done
+
 
 echo "✅ Deployment complete!"
-
-# Optional: Wait a bit and show relevant logs
-#echo "📋 Showing recent Stripe logs..."
-#sleep 3
-#docker logs --tail 50 killbill | grep -iE 'stripe|konbini|bank_transfer|8\.0\.5' || true

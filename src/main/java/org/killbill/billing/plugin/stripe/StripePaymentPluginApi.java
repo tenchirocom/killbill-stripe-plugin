@@ -332,6 +332,13 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
         final RequestOptions requestOptions = buildRequestOptions(context);
         final Iterable<PluginProperty> allProperties = PluginProperties.merge(paymentMethodProps.getProperties(), properties);
 
+        //
+        // fullSync option
+        //
+        final String fullSyncStr = PluginProperties.findPluginPropertyValue("fullSync", allProperties);
+        final boolean fullSyncOpt = Boolean.parseBoolean(fullSyncStr != null ? fullSyncStr : "false");
+        //final boolean fullSyncOpt = false;
+
         // ── Single-use payment methods (konbini, bank_transfer) ──────────────
         // These have no real Stripe PaymentMethod ID. We store the customer
         // details (name, email, phone) in additional_data and use a sentinel
@@ -503,8 +510,37 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
 
         try {
             dao.addPaymentMethod(kbAccountId, kbPaymentMethodId, additionalDataMap, stripeId, clock.getUTCNow(), context.getTenantId());
+
+            // === FULL SYNC AFTER CREATION (if option set) ===
+            logger.warn("FULLSYNC OPT = {}", fullSyncOpt);
+            if (fullSyncOpt && stripeId != null) {
+                fullSync(kbPaymentMethodId, stripeId, requestOptions, context);
+            }
+            
         } catch (final SQLException e) {
             throw new PaymentPluginApiException("Unable to add payment method", e);
+        }
+    }
+
+    private void fullSync(
+            UUID kbPaymentMethodId, 
+            String stripeId, 
+            RequestOptions requestOptions, 
+            CallContext context) {
+
+        if (stripeId == null) return;
+
+        logger.warn("ENTERING fullSync, payment_method_id={}, stripe id={}", kbPaymentMethodId, stripeId);
+
+        try {
+            final PaymentMethod pm = PaymentMethod.retrieve(stripeId, requestOptions);
+            dao.updatePaymentMethod(kbPaymentMethodId,
+                                    StripePluginProperties.toAdditionalDataMap(pm),
+                                    stripeId,
+                                    clock.getUTCNow(),
+                                    context.getTenantId());
+        } catch (Exception e) {
+            logger.warn("fullSync failed for payment method {}, continuing anyway", kbPaymentMethodId, e);
         }
     }
 
@@ -562,7 +598,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                                          final String defaultStripeId,
                                          final RequestOptions requestOptions) throws StripeException {
         if (existingCustomerId == null && customerId != null) {
-            final String defaultSource = Customer.retrieve(customerId, requestOptions).getDefaultSource();
+            final String defaultSource = Customer.retrieve(customerId, expandSourcesParams, requestOptions).getDefaultSource();
             if (defaultSource != null) {
                 return defaultSource;
             }
@@ -590,43 +626,82 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             throw new PaymentPluginApiException("Unable to retrieve payment method", e);
         }
 
-        // Single-use methods have a sentinel stripe_id — skip Stripe API call
-        if (!StripeMethodExtensions.isSingleUseStripeId(stripePaymentMethodsRecord.getStripeId())) {
-            final RequestOptions requestOptions = buildRequestOptions(context);
-            final String stripeId = stripePaymentMethodsRecord.getStripeId();
-            
-            try {
-                if (stripeId.startsWith("pm_")) {
-                    // Modern PaymentMethod - detach from customer
-                    PaymentMethod.retrieve(stripeId, requestOptions).detach(requestOptions);
-                } else if (stripeId.startsWith("src_")) {
-                    // Legacy Source - detach from customer (no params needed)
-                    Source.retrieve(stripeId, requestOptions).detach();
-                } else if (stripeId.startsWith("card_") || stripeId.startsWith("ba_")) {
-                    // Legacy Card or BankAccount - delete from customer's sources
-                    final String customerId = getCustomerIdNoException(kbAccountId, context);
+        // Bound check, valid result
+        if (stripePaymentMethodsRecord == null) {
+            throw new PaymentPluginApiException(
+                "The payment method record is null.",
+                new IllegalStateException("Missing STRIPE_CUSTOMER_ID")
+            );
+        }
+
+        // Skip Stripe API calls for single-use methods. This can be done locally.
+        if (StripeMethodExtensions.isSingleUseStripeId(stripePaymentMethodsRecord.getStripeId())) {
+            logger.info("Deleting single-use payment method {} - no Stripe API call needed", kbPaymentMethodId);
+            super.deletePaymentMethod(kbAccountId, kbPaymentMethodId, properties, context);
+            return;
+        }
+
+        final RequestOptions requestOptions = buildRequestOptions(context);
+        final String stripeId = stripePaymentMethodsRecord.getStripeId();
+        
+        try {
+            if (stripeId.startsWith("pm_")) {
+                // Modern PaymentMethod - detach from customer
+                PaymentMethod.retrieve(stripeId, requestOptions).detach(requestOptions);
+            } else if (stripeId.startsWith("src_")) {
+                // Legacy Source - detach from customer (no params needed)
+                Source.retrieve(stripeId, requestOptions).detach();
+            } else if (stripeId.startsWith("card_") || stripeId.startsWith("ba_")) {
+                // Legacy Card or BankAccount - delete from customer's sources
+                String customerId = getCustomerIdNoException(kbAccountId, context);
+
+                // Fallback: try to get customer_id from the stored payment method data
+                // This is actually possible if the STRIPE_CUSTOMER_ID field is deleted for
+                // some reason. But the deletion can continue, if the customer id has been
+                // added to the payment method data, which it often is.
+
+                if (customerId == null) {
+                    logger.warn("STRIPE_CUSTOMER_ID custom field is missing for account {}", kbAccountId);
+                    final Map<String, Object> additionalData = StripeDao.fromAdditionalData(
+                            stripePaymentMethodsRecord.getAdditionalData());
+                    customerId = (String) additionalData.get("customer_id");
+                    
                     if (customerId != null) {
-                        final PaymentSource source = Customer.retrieve(customerId, requestOptions)
-                            .getSources()
-                            .retrieve(stripeId, requestOptions);
-                        
-                        // Cast to the appropriate type and delete
-                        if (source instanceof Card) {
-                            ((Card) source).delete(requestOptions);
-                        } else if (source instanceof BankAccount) {
-                            ((BankAccount) source).delete(requestOptions);
-                        } else {
-                            throw new PaymentPluginApiException("Unsupported payment source type", new UnsupportedOperationException());
-                        }
+                        logger.info("Recovered customer_id={} from payment method additional_data for {}", 
+                                customerId, stripeId);
                     } else {
-                        throw new PaymentPluginApiException("Unable to find Stripe customer", new IllegalStateException());
+                        throw new PaymentPluginApiException(
+                            "Unable to find Stripe customer for legacy payment method " + stripeId 
+                            + " on account " + kbAccountId,
+                            new IllegalStateException("Missing STRIPE_CUSTOMER_ID")
+                        );
                     }
-                } else {
-                    throw new PaymentPluginApiException("Unknown payment method type: " + stripeId, new UnsupportedOperationException());
                 }
-            } catch (final StripeException e) {
-                throw new PaymentPluginApiException("Unable to delete Stripe payment method", e);
+
+                logger.warn("ABOUT TO GET FUBARED");
+
+                logger.warn("FUBAR: values are customerId={}, stripeId={} requestOptions={}", customerId, stripeId, requestOptions);
+
+                final PaymentSource source = Customer.retrieve(customerId, expandSourcesParams, requestOptions)
+                    .getSources()
+                    .retrieve(stripeId, requestOptions);
+
+                logger.warn("FUBAR: DONE! source={}", source);
+
+                // Cast to the appropriate type and delete
+                if (source instanceof Card) {
+                    ((Card) source).delete(requestOptions);
+                } else if (source instanceof BankAccount) {
+                    ((BankAccount) source).delete(requestOptions);
+                } else {
+                    throw new PaymentPluginApiException("Unsupported payment source type", new UnsupportedOperationException());
+                }
+
+            } else {
+                throw new PaymentPluginApiException("Unknown payment method type: " + stripeId, new UnsupportedOperationException());
             }
+        } catch (final StripeException e) {
+            throw new PaymentPluginApiException("Unable to delete Stripe payment method", e);
         }
 
         super.deletePaymentMethod(kbAccountId, kbPaymentMethodId, properties, context);
