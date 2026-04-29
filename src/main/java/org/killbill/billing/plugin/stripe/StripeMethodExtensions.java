@@ -103,6 +103,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.security.SecureRandom;
 
 public final class StripeMethodExtensions {
 
@@ -131,6 +132,17 @@ public final class StripeMethodExtensions {
      * sentinel is detectable by isSingleUseStripeId() and is safe to store.
      */
     public static final String SINGLE_USE_STRIPE_ID_PREFIX = "singleuse_";
+
+    /**
+     * The allowable characters used in the random string postfixed to the single use
+     * method id. Mimicks the Stripe id pattern.
+     */
+    private static final String ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+    /**
+     * Random seed for the stripe id generator.
+     */
+    private static final SecureRandom RANDOM = new SecureRandom();
 
     /**
      * The complete set of single-use payment method type keys this class handles.
@@ -188,13 +200,32 @@ public final class StripeMethodExtensions {
      * Called at purchasePayment() time, when the payment method record is retrieved
      * from the DB and its additionalData is deserialized.
      *
-     * @param additionalData  Deserialized additional_data map from the DB record.
-     * @return                The type key ("konbini", "bank_transfer"), or null.
+     * @param additionalData Deserialized additional_data map from the DB record.
+     * @return The type key ("konbini", "bank_transfer"), or null.
      */
     public static String getSingleUseType(final Map<String, Object> additionalData) {
-        if (additionalData == null) return null;
+        if (additionalData == null) {
+            return null;
+        }
+
+        // Primary method: look for the explicit single_use_type key
         final Object value = additionalData.get(SINGLE_USE_TYPE);
-        return (value instanceof String && SINGLE_USE_TYPES.contains(value)) ? (String) value : null;
+        if (value instanceof String && SINGLE_USE_TYPES.contains(value)) {
+            return (String) value;
+        }
+
+        // Fallback: try to extract from sentinel stripe_id (in case additional_data is incomplete)
+        final String stripeId = (String) additionalData.get("id");
+        if (stripeId != null && stripeId.startsWith(SINGLE_USE_STRIPE_ID_PREFIX)) {
+            // e.g. singleuse_konbini_1TKsXURWcYTdjAvFKxEWr585
+            for (String type : SINGLE_USE_TYPES) {
+                if (stripeId.contains("_" + type + "_")) {
+                    return type;
+                }
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -231,7 +262,10 @@ public final class StripeMethodExtensions {
      * @return          true if this is a sentinel ID, not a real Stripe ID.
      */
     public static boolean isSingleUseStripeId(final String stripeId) {
-        return stripeId != null && stripeId.startsWith(SINGLE_USE_STRIPE_ID_PREFIX);
+        if (stripeId == null) {
+            return false;
+        }
+        return stripeId.startsWith(SINGLE_USE_STRIPE_ID_PREFIX);
     }
 
     /**
@@ -241,7 +275,12 @@ public final class StripeMethodExtensions {
      * @return               The sentinel string, e.g. "singleuse_konbini".
      */
     public static String buildSentinelStripeId(final String singleUseType) {
-        return SINGLE_USE_STRIPE_ID_PREFIX + singleUseType;
+        StringBuilder sb = new StringBuilder(24);
+
+        for (int i = 0; i < 24; i++) {
+            sb.append(ID_ALPHABET.charAt(RANDOM.nextInt(ID_ALPHABET.length())));
+        }
+        return SINGLE_USE_STRIPE_ID_PREFIX + singleUseType + "_" + sb.toString();
     }
 
     // -----------------------------------------------------------------------
@@ -314,7 +353,7 @@ public final class StripeMethodExtensions {
             // Optional
             final String name  = PluginProperties.findPluginPropertyValue("fullname", properties);
             if (name != null && !name.isBlank()) {
-                data.put("name", name);
+                data.put("fullname", name);
             }
         }
 

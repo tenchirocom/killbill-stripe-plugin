@@ -35,16 +35,17 @@ public class StripePaymentMethodPlugin extends PluginPaymentMethodPlugin {
 
         // Inject key fields for single-use methods so they look consistent with cards
         if (StripeMethodExtensions.isSingleUseStripeId(stripePaymentMethodsRecord.getStripeId())) {
+            // Restore deterministic values if they are missing
+            externalPaymentMethodId = (String) stripePaymentMethodsRecord.getStripeId();
             additionalData.putIfAbsent("object", "payment_method");
             additionalData.putIfAbsent("type", StripeMethodExtensions.getSingleUseType(additionalData));
             additionalData.putIfAbsent("id", stripePaymentMethodsRecord.getStripeId());           // sentinel
-            additionalData.putIfAbsent("livemode", false);   // can be improved later
-            additionalData.putIfAbsent("created", System.currentTimeMillis() / 1000);
-            
-            // Use the sentinel as external ID if none exists
-            if (externalPaymentMethodId == null) {
-                externalPaymentMethodId = stripePaymentMethodsRecord.getStripeId();
-            }
+            // Explicitly ensure required keys exist, even if null
+            additionalData.putIfAbsent("livemode", null);
+            additionalData.putIfAbsent("created", null);
+            additionalData.putIfAbsent("customer_id", null);
+        } else {
+            externalPaymentMethodId = (String) additionalData.get("id");
         }
 
         return new StripePaymentMethodPlugin(
