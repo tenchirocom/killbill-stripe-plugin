@@ -512,7 +512,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             dao.addPaymentMethod(kbAccountId, kbPaymentMethodId, additionalDataMap, stripeId, clock.getUTCNow(), context.getTenantId());
 
             // === FULL SYNC AFTER CREATION (if option set) ===
-            logger.warn("FULLSYNC OPT = {}", fullSyncOpt);
+            logger.warn("STRIPE FULLSYNC OPT = {}", fullSyncOpt);
             if (fullSyncOpt && stripeId != null) {
                 fullSync(kbPaymentMethodId, stripeId, requestOptions, context);
             }
@@ -678,15 +678,9 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                     }
                 }
 
-                logger.warn("ABOUT TO GET FUBARED");
-
-                logger.warn("FUBAR: values are customerId={}, stripeId={} requestOptions={}", customerId, stripeId, requestOptions);
-
                 final PaymentSource source = Customer.retrieve(customerId, expandSourcesParams, requestOptions)
                     .getSources()
                     .retrieve(stripeId, requestOptions);
-
-                logger.warn("FUBAR: DONE! source={}", source);
 
                 // Cast to the appropriate type and delete
                 if (source instanceof Card) {
