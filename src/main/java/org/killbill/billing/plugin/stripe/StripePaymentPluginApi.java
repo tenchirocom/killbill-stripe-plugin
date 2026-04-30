@@ -1494,10 +1494,10 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                             paymentIntentParams.put("payment_method_types", pmTypesBuilder.build());
                         }
 
-                        // The idempotency key uses the killbill transaction id and this prevents
-                        // creating a new intent for the same transaction within a 24hour window.
+                        // The idempotency key uses the killbill payment (invoice) id and this prevents
+                        // creating a new intent for the same invoice within a 24hour window.
                         // Generate idempotency key from transaction ID for consistency
-                        String idempotencyKey = kbTransactionId.toString();
+                        String idempotencyKey = "kb_inv_" + kbPaymentId;
                         RequestOptions requestOptionsWithIdempotency = RequestOptions.builder()
                             .setApiKey(requestOptions.getApiKey())
                             .setIdempotencyKey(idempotencyKey)
@@ -1581,6 +1581,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             if (StripeMethodExtensions.requiresSpecialHandling(singleUseType)) {
                 final Map<String, Object> nextActionDetails = StripeMethodExtensions.extractNextActionDetails(response, singleUseType);
                 if (!nextActionDetails.isEmpty()) {
+                    logger.info("Extracted next_action details for {}: {}", singleUseType, nextActionDetails);
                     // Update the response record with the flattened voucher/bank details
                     dao.updateResponse(responsesRecord, nextActionDetails);
                     // Re-fetch the updated record so the plugin returns the new properties

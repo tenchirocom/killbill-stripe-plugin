@@ -641,12 +641,13 @@ public final class StripeMethodExtensions {
                 nextAction.getKonbiniDisplayDetails();
 
             if (konbini != null) {
-                // Most important fields for customer
-                details.put("konbini_confirmation_number", konbini.getConfirmationNumber());
+                // Try different possible getter names (library version differences)
+                details.put("konbini_confirmation_number", 
+                    getFieldSafely(konbini, "confirmationNumber", "confirmation_number"));
+
                 details.put("konbini_expires_at", konbini.getExpiresAt());
                 details.put("konbini_hosted_voucher_url", konbini.getHostedVoucherUrl());
 
-                // Store information
                 if (konbini.getStores() != null) {
                     details.put("konbini_stores", konbini.getStores());
                 }
@@ -671,6 +672,21 @@ public final class StripeMethodExtensions {
         }
 
         return details;
+    }
+
+    // Helper to safely extract fields that may have different getter names
+    private static Object getFieldSafely(Object obj, String camelCase, String snakeCase) {
+        try {
+            // Try camelCase first (most common in newer SDK)
+            java.lang.reflect.Method m = obj.getClass().getMethod("get" + camelCase.substring(0,1).toUpperCase() + camelCase.substring(1));
+            return m.invoke(obj);
+        } catch (Exception ignored) {}
+        try {
+            // Try snake_case style if available
+            java.lang.reflect.Method m = obj.getClass().getMethod("get" + snakeCase);
+            return m.invoke(obj);
+        } catch (Exception ignored) {}
+        return null;
     }
 
     // -----------------------------------------------------------------------
