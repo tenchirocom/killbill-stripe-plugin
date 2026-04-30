@@ -84,6 +84,7 @@ import com.stripe.model.PaymentIntent;
 import com.stripe.model.PaymentMethod;
 import com.stripe.model.PaymentSource;
 import com.stripe.model.PaymentSourceCollection;
+import com.stripe.model.PaymentMethodCollection;
 import com.stripe.model.Refund;
 import com.stripe.model.SetupIntent;
 import com.stripe.model.Source;
@@ -332,33 +333,50 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
         final RequestOptions requestOptions = buildRequestOptions(context);
         final Iterable<PluginProperty> allProperties = PluginProperties.merge(paymentMethodProps.getProperties(), properties);
 
-        //
-        // fullSync option
-        //
-        final String fullSyncStr = PluginProperties.findPluginPropertyValue("fullSync", allProperties);
-        final boolean fullSyncOpt = Boolean.parseBoolean(fullSyncStr != null ? fullSyncStr : "false");
-        //final boolean fullSyncOpt = false;
-
-        // ── Single-use payment methods (konbini, bank_transfer) ──────────────
-        // These have no real Stripe PaymentMethod ID. We store the customer
-        // details (name, email, phone) in additional_data and use a sentinel
-        // stripe_id so the record can be distinguished from real Stripe objects.
+        // Check for Single-use method
         final String singleUseType = StripeMethodExtensions.getSingleUseType(allProperties);
+
+        // ── Single-use payment methods (i.e. konbini, bank_transfer) ──────────────
+        // These have no real Stripe PaymentMethod ID. The payment methods are created on the fly
+        // for specific payments. However, the customer details (i.e. name, email, phone, ...) are
+        // stored in additional_data and a sentinel stripe_id is generated so the method can be
+        // uniquely identified and distinguished from real Stripe object.
+
         if (singleUseType != null) {
+            //
+            // Add Single-Use Pseudo Payment Method
+            //
             logger.info("Registering single-use payment method '{}' for kbPaymentMethodId={}", singleUseType, kbPaymentMethodId);
 
-            String existingCustomerId = getCustomerIdNoException(kbAccountId, context);
+            //String existingCustomerId = getCustomerIdNoException(kbAccountId, context);
+            //final String customerId = ensureStripeCustomer(kbAccountId, context, requestOptions, allProperties);
 
-            // Stripe strictly requires a Customer object for Bank Transfers (customer_balance)
-            if ("bank_transfer".equals(singleUseType)) {
-                if (existingCustomerId == null) {
-                    try {
-                        existingCustomerId = createStripeCustomer(kbAccountId, null, ImmutableMap.of(), requestOptions, allProperties, context);
-                    } catch (final StripeException e) {
-                        throw new PaymentPluginApiException("Failed to create Stripe customer required for bank transfer", e);
+            // Ensure a Stripe Customer exists for ALL single-use types.
+            // konbini does not strictly require a customer at the Stripe API level, but
+            // creating one here guarantees consistent account linkage and means
+            // buildStoredMethodData always receives a valid customerId rather than null.
+            // bank_transfer requires a customer — Stripe rejects the PaymentIntent without one.
+
+            String existingCustomerId = getCustomerIdNoException(kbAccountId, context);
+            if (existingCustomerId == null) {
+                try {
+                    // Create a new Stripe customer, there is no existing customer id
+                    final Customer newCustomer = createStripeCustomer(
+                        kbAccountId,
+                        existingCustomerId,
+                        ImmutableMap.of(),
+                        requestOptions,
+                        allProperties,
+                        context
+                    );
+                    if (newCustomer != null) {
+                        existingCustomerId = newCustomer.getId();
                     }
+                } catch (final StripeException e) {
+                    throw new PaymentPluginApiException("Failed to create or retrieve Stripe customer for account " + kbAccountId, e);
                 }
             }
+
             final Map<String, Object> additionalData;
             try {
                 additionalData = StripeMethodExtensions.buildStoredMethodData(singleUseType, allProperties, requestOptions, existingCustomerId);
@@ -427,18 +445,26 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
 
         final Map<String, Object> additionalDataMap;
         final String stripeId;
-        String customerId;
         final String existingCustomerId = getCustomerIdNoException(kbAccountId, context);
 
         if (paymentMethodIdInStripe != null) {
             if ("payment_method".equals(objectType)) {
+                //
+                // Add a payment_method method. PaymentMethod (pm_xxx) is Stripe's modern,
+                // recommended API for representing payment instruments. Handles cards, bank
+                // accounts, wallets, and other payment methods under one consistent API
+                //
                 try {
                     final PaymentMethod stripePaymentMethod = PaymentMethod.retrieve(paymentMethodIdInStripe, requestOptions);
                     final PaymentMethod paymentMethodForAdditionalData;
                     if (existingCustomerId == null) {
-                        createStripeCustomer(kbAccountId, null,
-                                             ImmutableMap.of("payment_method", stripePaymentMethod.getId()),
-                                             requestOptions, allProperties, context);
+                        createStripeCustomer(
+                            kbAccountId, null,
+                            ImmutableMap.of("payment_method", stripePaymentMethod.getId()),
+                            requestOptions,
+                            allProperties,
+                            context
+                        );
                         paymentMethodForAdditionalData = stripePaymentMethod;
                     } else {
                         paymentMethodForAdditionalData = stripePaymentMethod.attach(
@@ -450,54 +476,176 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                     throw new PaymentPluginApiException("Error calling Stripe while adding payment method", e);
                 }
             } else if ("token".equals(objectType)) {
+                //
+                // Add a token payment method. Token (tok_xxx) is a temporary, single-use object
+                // that securely represents card details collected on the client side.
+                // Legacy API: Still supported for cards, but Stripe recommends using PaymentMethods
+                // with SetupIntents instead
+                //
                 try {
                     final Token stripeToken = Token.retrieve(paymentMethodIdInStripe, requestOptions);
-                    additionalDataMap = StripePluginProperties.toAdditionalDataMap(stripeToken);
+
                     if (existingCustomerId == null) {
-                        customerId = createStripeCustomer(kbAccountId, null,
-                                                          ImmutableMap.of("source", stripeToken.getId()),
-                                                          requestOptions, allProperties, context);
-                        stripeId = retrievePaymentMethod(customerId, null, getTokenInnerId(stripeToken), requestOptions);
+                        // Create new customer
+                        final Customer newCustomer = createStripeCustomer(
+                            kbAccountId, null,
+                            ImmutableMap.of("source", stripeToken.getId()),
+                            requestOptions,
+                            allProperties,
+                            context
+                        );
+                        final Customer customerWithSources = Customer.retrieve(newCustomer.getId(), expandSourcesParams, requestOptions);
+                        
+                        final String cardId = customerWithSources.getDefaultSource();
+                        final PaymentSource resultingCard = customerWithSources.getSources().getData()
+                            .stream()
+                            .filter(s -> s.getId().equals(cardId))
+                            .findFirst()
+                            .orElse(null);
+                        
+                        // Use helper method
+                        final PaymentMethodResult result = retrievePaymentMethodForCard(
+                            newCustomer.getId(),
+                            cardId,
+                            resultingCard,
+                            requestOptions
+                        );
+                        stripeId = result.stripeId;
+                        additionalDataMap = result.additionalDataMap;
                     } else {
+                        // Existing customer
                         final Customer customer = Customer.retrieve(existingCustomerId, expandSourcesParams, requestOptions);
                         final Map<String, Object> attachParams = new HashMap<>();
                         attachParams.put("source", stripeToken.getId());
+                        
                         final PaymentSource attachedSource = customer.getSources().create(attachParams, requestOptions);
-                        stripeId = attachedSource.getId();
+                        final String cardId = attachedSource.getId();
+                        
+                        // Use helper method
+                        final PaymentMethodResult result = retrievePaymentMethodForCard(
+                            existingCustomerId,
+                            cardId,
+                            attachedSource,
+                            requestOptions
+                        );
+                        stripeId = result.stripeId;
+                        additionalDataMap = result.additionalDataMap;
+
                         if (setDefault) {
-                            customer.update(ImmutableMap.of("default_source", stripeId), requestOptions);
+                            customer.update(ImmutableMap.of("default_source", cardId), requestOptions);
                         }
                     }
                 } catch (final StripeException e) {
                     throw new PaymentPluginApiException("Error calling Stripe while adding payment method", e);
                 }
             } else if ("source".equals(objectType)) {
+                //
+                // Add a source payment method type. Source (src_xxx) is a flexible, reusable object that
+                // represents various payment methods beyond just cards. Legacy API: Still supported, but
+                // Stripe recommends using PaymentMethods for most use cases
+                //
                 try {
                     final Source stripeSource = Source.retrieve(paymentMethodIdInStripe, requestOptions);
-                    final PaymentSource sourceForAdditionalData;
+                    final String customerId;
+                    final PaymentSource attachedSource;
+                    
                     if (existingCustomerId == null) {
-                        createStripeCustomer(kbAccountId, null,
-                                             ImmutableMap.of("source", stripeSource.getId()),
-                                             requestOptions, allProperties, context);
-                        sourceForAdditionalData = stripeSource;
+                        final Customer newCustomer = createStripeCustomer(
+                            kbAccountId, null,
+                            ImmutableMap.of("source", stripeSource.getId()),
+                            requestOptions,
+                            allProperties,
+                            context
+                        );
+                        customerId = newCustomer.getId();
+                        
+                        final Customer customerWithSources = Customer.retrieve(
+                            customerId, expandSourcesParams, requestOptions);
+                        attachedSource = customerWithSources.getSources().getData()
+                            .stream()
+                            .filter(s -> s.getId().equals(stripeSource.getId()))
+                            .findFirst()
+                            .orElse(stripeSource);
                     } else {
+                        customerId = existingCustomerId;
                         final Customer customer = Customer.retrieve(existingCustomerId, expandSourcesParams, requestOptions);
                         final Map<String, Object> attachParams = new HashMap<>();
                         attachParams.put("source", stripeSource.getId());
-                        sourceForAdditionalData = customer.getSources().create(attachParams, requestOptions);
+                        attachedSource = customer.getSources().create(attachParams, requestOptions);
                     }
-                    additionalDataMap = StripePluginProperties.toAdditionalDataMap(sourceForAdditionalData);
-                    stripeId = sourceForAdditionalData.getId();
+                    
+                    // If it's a card source, try to get the PaymentMethod for complete data
+                    if ("card".equals(stripeSource.getType()) && attachedSource instanceof Card) {
+                        final PaymentMethodResult result = retrievePaymentMethodForCard(
+                            customerId,
+                            attachedSource.getId(),
+                            attachedSource,
+                            requestOptions
+                        );
+                        stripeId = result.stripeId;
+                        additionalDataMap = result.additionalDataMap;
+                    } else {
+                        // Non-card source - use source data directly
+                        stripeId = attachedSource.getId();
+                        additionalDataMap = StripePluginProperties.toAdditionalDataMap(attachedSource);
+                    }
                 } catch (final StripeException e) {
                     throw new PaymentPluginApiException("Error calling Stripe while adding payment method", e);
                 }
             } else if ("bank_account".equals(objectType)) {
+                //
+                // Add a bank_account payment method. Bank Account (btok_xxx token → ba_xxx attached) is
+                // a legacy object for representing bank account payment methods. Legacy API: Predates
+                // PaymentMethods, but still widely used for ACH payments. May have PaymentMethod. Modern
+                // ACH Direct Debit creates corresponding pm_xxx objects.
+                //
                 try {
-                    final PaymentSource paymentSource = Customer.retrieve(existingCustomerId, expandSourcesParams, requestOptions)
-                                                                .getSources()
-                                                                .retrieve(paymentMethodIdInStripe, requestOptions);
-                    additionalDataMap = StripePluginProperties.toAdditionalDataMap(paymentSource);
-                    stripeId = paymentSource.getId();
+                    final String customerId;
+                    final PaymentSource attachedBankAccount;
+                    
+                    if (existingCustomerId == null) {
+                        // Create new customer with bank account token
+                        final Customer newCustomer = createStripeCustomer(
+                            kbAccountId, null,
+                            ImmutableMap.of("source", paymentMethodIdInStripe), // btok_xxx
+                            requestOptions,
+                            allProperties,
+                            context
+                        );
+                        customerId = newCustomer.getId();
+                        
+                        // Retrieve customer with expanded sources to get the attached bank account
+                        final Customer customerWithSources = Customer.retrieve(
+                            customerId, expandSourcesParams, requestOptions);
+                        attachedBankAccount = customerWithSources.getSources().getData()
+                            .stream()
+                            .filter(s -> s instanceof BankAccount)
+                            .findFirst()
+                            .orElse(null);
+                    } else {
+                        // Attach bank account token to existing customer
+                        customerId = existingCustomerId;
+                        final Customer customer = Customer.retrieve(
+                            existingCustomerId, expandSourcesParams, requestOptions);
+                        final Map<String, Object> attachParams = new HashMap<>();
+                        attachParams.put("source", paymentMethodIdInStripe); // btok_xxx
+                        attachedBankAccount = customer.getSources().create(attachParams, requestOptions);
+                    }
+                    
+                    // Try to find corresponding PaymentMethod for complete data (ACH Direct Debit)
+                    if (attachedBankAccount instanceof BankAccount) {
+                        final PaymentMethodResult result = retrievePaymentMethodForBankAccount(
+                            customerId,
+                            attachedBankAccount.getId(),
+                            attachedBankAccount,
+                            requestOptions
+                        );
+                        stripeId = result.stripeId;
+                        additionalDataMap = result.additionalDataMap;
+                    } else {
+                        stripeId = attachedBankAccount.getId();
+                        additionalDataMap = StripePluginProperties.toAdditionalDataMap(attachedBankAccount);
+                    }
                 } catch (final StripeException e) {
                     throw new PaymentPluginApiException("Error calling Stripe while adding payment method", e);
                 }
@@ -505,42 +653,112 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                 throw new UnsupportedOperationException("Payment Method type not yet supported: " + objectType);
             }
         } else {
-            throw new PaymentPluginApiException("USER", "PaymentMethodPlugin#getExternalPaymentMethodId or sessionId plugin property must be passed");
+            throw new PaymentPluginApiException(
+                "USER",
+                "PaymentMethodPlugin#getExternalPaymentMethodId or sessionId plugin property must be passed"
+            );
         }
 
         try {
-            dao.addPaymentMethod(kbAccountId, kbPaymentMethodId, additionalDataMap, stripeId, clock.getUTCNow(), context.getTenantId());
-
-            // === FULL SYNC AFTER CREATION (if option set) ===
-            logger.warn("STRIPE FULLSYNC OPT = {}", fullSyncOpt);
-            if (fullSyncOpt && stripeId != null) {
-                fullSync(kbPaymentMethodId, stripeId, requestOptions, context);
-            }
-            
+            dao.addPaymentMethod(
+                kbAccountId,
+                kbPaymentMethodId,
+                additionalDataMap,
+                stripeId,
+                clock.getUTCNow(),
+                context.getTenantId()
+            );
         } catch (final SQLException e) {
             throw new PaymentPluginApiException("Unable to add payment method", e);
         }
     }
 
-    private void fullSync(
-            UUID kbPaymentMethodId, 
-            String stripeId, 
-            RequestOptions requestOptions, 
-            CallContext context) {
+    /**
+     * Retrieves the PaymentMethod associated with a card source by fingerprint matching.
+     * Returns the PaymentMethod ID and additionalDataMap.
+     */
+    private PaymentMethodResult retrievePaymentMethodForCard(
+            final String customerId,
+            final String cardId,
+            final PaymentSource cardSource,
+            final RequestOptions requestOptions) throws StripeException {
+        
+        // List PaymentMethods to find the one matching this card
+        final Map<String, Object> pmListParams = new HashMap<>();
+        pmListParams.put("customer", customerId);
+        pmListParams.put("type", "card");
+        
+        final PaymentMethodCollection paymentMethods = PaymentMethod.list(pmListParams, requestOptions);
+        
+        // Find the PaymentMethod matching this card by fingerprint
+        final String cardFingerprint = ((com.stripe.model.Card) cardSource).getFingerprint();
+        final PaymentMethod matchingPM = paymentMethods.getData().stream()
+            .filter(pm -> pm.getCard() != null && 
+                        pm.getCard().getFingerprint().equals(cardFingerprint))
+            .findFirst()
+            .orElse(null);
+        
+        if (matchingPM != null) {
+            // Use PaymentMethod for complete data
+            return new PaymentMethodResult(
+                matchingPM.getId(),
+                StripePluginProperties.toAdditionalDataMap(matchingPM)
+            );
+        } else {
+            // Fallback: use card source data (incomplete)
+            return new PaymentMethodResult(
+                cardId,
+                StripePluginProperties.toAdditionalDataMap(cardSource)
+            );
+        }
+    }
 
-        if (stripeId == null) return;
+    private PaymentMethodResult retrievePaymentMethodForBankAccount(
+            final String customerId,
+            final String bankAccountId,
+            final PaymentSource bankAccountSource,
+            final RequestOptions requestOptions
+    ) throws StripeException
+    {    
+        // List PaymentMethods of type us_bank_account
+        final Map<String, Object> pmListParams = new HashMap<>();
+        pmListParams.put("customer", customerId);
+        pmListParams.put("type", "us_bank_account");
+        
+        final com.stripe.model.PaymentMethodCollection paymentMethods = 
+            PaymentMethod.list(pmListParams, requestOptions);
+        
+        // Find the PaymentMethod matching this bank account by last4 and routing number
+        final BankAccount bankAccount = (BankAccount) bankAccountSource;
+        final PaymentMethod matchingPM = paymentMethods.getData().stream()
+            .filter(pm -> pm.getUsBankAccount() != null && 
+                        pm.getUsBankAccount().getLast4().equals(bankAccount.getLast4()) &&
+                        pm.getUsBankAccount().getRoutingNumber().equals(bankAccount.getRoutingNumber()))
+            .findFirst()
+            .orElse(null);
+        
+        if (matchingPM != null) {
+            return new PaymentMethodResult(
+                matchingPM.getId(),
+                StripePluginProperties.toAdditionalDataMap(matchingPM)
+            );
+        } else {
+            // Fallback: use bank account source data
+            return new PaymentMethodResult(
+                bankAccountId,
+                StripePluginProperties.toAdditionalDataMap(bankAccountSource)
+            );
+        }
+    }
 
-        logger.warn("ENTERING fullSync, payment_method_id={}, stripe id={}", kbPaymentMethodId, stripeId);
-
-        try {
-            final PaymentMethod pm = PaymentMethod.retrieve(stripeId, requestOptions);
-            dao.updatePaymentMethod(kbPaymentMethodId,
-                                    StripePluginProperties.toAdditionalDataMap(pm),
-                                    stripeId,
-                                    clock.getUTCNow(),
-                                    context.getTenantId());
-        } catch (Exception e) {
-            logger.warn("fullSync failed for payment method {}, continuing anyway", kbPaymentMethodId, e);
+    // Simple result holder class
+    private static class PaymentMethodResult {
+        final String stripeId;
+        final Map<String, Object> additionalDataMap;
+        
+        PaymentMethodResult(String stripeId, Map<String, Object> additionalDataMap) {
+            this.stripeId = stripeId;
+            this.additionalDataMap = additionalDataMap;
         }
     }
 
@@ -552,7 +770,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
         }
     }
 
-    private String createStripeCustomer(final UUID kbAccountId,
+    private Customer createStripeCustomer(final UUID kbAccountId,
                                         final String existingCustomerId,
                                         final ImmutableMap<String, Object> customerParams,
                                         final RequestOptions requestOptions,
@@ -583,14 +801,16 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             try {
                 killbillAPI.getCustomFieldUserApi().addCustomFields(
                         ImmutableList.of(new PluginCustomField(kbAccountId, ObjectType.ACCOUNT,
-                                                               "STRIPE_CUSTOMER_ID", customer.getId(),
-                                                               clock.getUTCNow())), context);
+                                                            "STRIPE_CUSTOMER_ID", customer.getId(),
+                                                            clock.getUTCNow())), context);
             } catch (final CustomFieldApiException e) {
                 throw new PaymentPluginApiException("Unable to add custom field", e);
             }
-            return customer.getId();
+            return customer;    // The customer id can be retrieved with customer.getId()
         } else {
-            return existingCustomerId;
+            return null;        // Caller already has the ID if existingCustomerId != null.
+                                // Callers that need a Customer object only call this when
+                                // existingCustomerId is null (new-customer path).
         }
     }
 
@@ -981,10 +1201,21 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                                                                final CallContext context) throws PaymentPluginApiException {
         final RequestOptions requestOptions = buildRequestOptions(context);
         String stripeCustomerId = getCustomerIdNoException(kbAccountId, context);
-        try {
-            stripeCustomerId = createStripeCustomer(kbAccountId, stripeCustomerId, ImmutableMap.of(), requestOptions, properties, context);
-        } catch (final StripeException e) {
-            throw new PaymentPluginApiException("Unable to create Stripe customer", e);
+        if (stripeCustomerId == null) {
+            try {
+                final Customer newCustomer = createStripeCustomer(
+                    kbAccountId, null,
+                    ImmutableMap.of(),
+                    requestOptions,
+                    properties,
+                    context
+                );
+                if (newCustomer != null) {
+                    stripeCustomerId = newCustomer.getId();
+                }
+            } catch (final StripeException e) {
+                throw new PaymentPluginApiException("Unable to create Stripe customer", e);
+            }
         }
 
         final Map<String, Object> params = new HashMap<>();
