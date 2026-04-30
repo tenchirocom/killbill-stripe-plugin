@@ -1,4 +1,20 @@
 /*
+ * Copyright 2026 Tenchiro LLC
+ *
+ * Tenchiro LLC licenses this file to you under the Apache License, version 2.0
+ * (the "License"); you may not use this file except in compliance with the
+ * License.  You may obtain a copy of the License at:
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ */
+
+/*
  * StripeMethodExtensions.java
  * ===========================
  * Package: org.killbill.billing.plugin.stripe
@@ -103,7 +119,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.Collections;
 import java.security.SecureRandom;
+
 
 public final class StripeMethodExtensions {
 
@@ -121,7 +139,7 @@ public final class StripeMethodExtensions {
      *
      * Value example: "konbini" or "bank_transfer"
      */
-    public static final String SINGLE_USE_TYPE = "single_use_type";
+    public static final String METHOD_TYPE = "type";
 
     /**
      * Prefix prepended to the type key to form the sentinel stripeId stored in
@@ -189,7 +207,7 @@ public final class StripeMethodExtensions {
      * @return            The type key ("konbini", "bank_transfer"), or null.
      */
     public static String getSingleUseType(final Iterable<PluginProperty> properties) {
-        final String value = PluginProperties.findPluginPropertyValue(SINGLE_USE_TYPE, properties);
+        final String value = PluginProperties.findPluginPropertyValue(METHOD_TYPE, properties);
         return SINGLE_USE_TYPES.contains(value) ? value : null;
     }
 
@@ -209,7 +227,7 @@ public final class StripeMethodExtensions {
         }
 
         // Primary method: look for the explicit single_use_type key
-        final Object value = additionalData.get(SINGLE_USE_TYPE);
+        final Object value = additionalData.get(METHOD_TYPE);
         if (value instanceof String && SINGLE_USE_TYPES.contains(value)) {
             return (String) value;
         }
@@ -310,7 +328,6 @@ public final class StripeMethodExtensions {
     ) {
         final Map<String, Object> data = new HashMap<>();
         // Always store the type so getSingleUseType(Map) can detect it later.
-        data.put(SINGLE_USE_TYPE, singleUseType);
         data.put("type", singleUseType);
         data.put("object", "payment_method");
         data.put("customer_id", customer_id);
@@ -323,13 +340,13 @@ public final class StripeMethodExtensions {
             final String email = PluginProperties.findPluginPropertyValue("email", properties);
             final String store = PluginProperties.findPluginPropertyValue("store", properties);
             if (name == null || name.isBlank()) {
-                throw new IllegalArgumentException("konbini payment method requires 'fullname' plugin property.");
+                throw new IllegalArgumentException("konbini payment method requires 'fullname'.");
             }
             if (email == null || email.isBlank()) {
-                throw new IllegalArgumentException("konbini payment method requires 'email' plugin property.");
+                throw new IllegalArgumentException("konbini payment method requires 'email'.");
             }
             if (store == null || store.isBlank()) {
-                throw new IllegalArgumentException("konbini payment method requires 'store' plugin property.");
+                throw new IllegalArgumentException("konbini payment method requires 'store'.");
             }
             data.put("fullname", name);
             data.put("email", email);
@@ -346,7 +363,7 @@ public final class StripeMethodExtensions {
             // Required
             final String email = PluginProperties.findPluginPropertyValue("email", properties);
             if (email == null || email.isBlank()) {
-                throw new IllegalArgumentException("bank_transfer payment method requires 'email' plugin property.");
+                throw new IllegalArgumentException("bank_transfer payment method requires 'email'.");
             }
             data.put("email", email);
 
@@ -402,13 +419,39 @@ public final class StripeMethodExtensions {
      * @param singleUseType  Our internal type key.
      * @return               A map for the "payment_method_data" parameter.
      */
-    public static Map<String, Object> buildPaymentMethodData(final String singleUseType) {
-        if ("bank_transfer".equals(singleUseType)) {
-            // Stripe API requires "customer_balance" as the type for bank transfers.
-            return ImmutableMap.of("type", STRIPE_BANK_TRANSFER_TYPE);
+    public static Map<String, Object> buildPaymentMethodData(final String singleUseType,
+                                                             final Map<String, Object> additionalData) {
+        if ("konbini".equals(singleUseType)) {
+            Map<String, Object> billingDetails = new HashMap<>();
+
+            billingDetails.put("name",  additionalData.get("fullname"));
+            billingDetails.put("email", additionalData.get("email"));
+
+            if (additionalData.containsKey("phone")) {
+                billingDetails.put("phone", additionalData.get("phone"));
+            }
+
+            return Map.of(
+                "type", "konbini",
+                "billing_details", billingDetails
+            );
         }
-        // Konbini uses "konbini" directly.
-        return ImmutableMap.of("type", singleUseType);
+
+        if ("bank_transfer".equals(singleUseType)) {
+            // Bank transfer (customer_balance) is very minimal
+            // email is useful but not strictly required by Stripe API
+            Map<String, Object> data = new HashMap<>();
+            data.put("type", "customer_balance");
+
+            // Optional: you can still pass email if you have it
+            if (additionalData.containsKey("email")) {
+                data.put("email", additionalData.get("email"));
+            }
+
+            return data;
+        }
+
+        return Collections.emptyMap();
     }
 
     /**
@@ -580,50 +623,49 @@ public final class StripeMethodExtensions {
      * @return               A flat map of key→value strings for storage.
      */
     public static Map<String, Object> extractNextActionDetails(
-        final PaymentIntent intent,
-        final String singleUseType
-    ) {
+            final PaymentIntent intent,
+            final String singleUseType) {
+
         final Map<String, Object> details = new HashMap<>();
+
         if (intent == null || intent.getNextAction() == null) {
             return details;
         }
 
         final PaymentIntent.NextAction nextAction = intent.getNextAction();
 
-        if ("konbini".equals(singleUseType)
-            && "konbini_display_details".equals(nextAction.getType())) {
+        if ("konbini".equals(singleUseType) && 
+            "konbini_display_details".equals(nextAction.getType())) {
 
-            final PaymentIntent.NextAction.KonbiniDisplayDetails konbini =
+            final PaymentIntent.NextAction.KonbiniDisplayDetails konbini = 
                 nextAction.getKonbiniDisplayDetails();
 
             if (konbini != null) {
-                if (konbini.getHostedVoucherUrl() != null) {
-                    details.put("konbini_hosted_voucher_url", konbini.getHostedVoucherUrl());
-                }
-                if (konbini.getExpiresAt() != null) {
-                    details.put("konbini_expires_at", konbini.getExpiresAt());
-                }
-                // Stores contains the payment codes for specific convenience stores
+                // Most important fields for customer
+                details.put("konbini_confirmation_number", konbini.getConfirmationNumber());
+                details.put("konbini_expires_at", konbini.getExpiresAt());
+                details.put("konbini_hosted_voucher_url", konbini.getHostedVoucherUrl());
+
+                // Store information
                 if (konbini.getStores() != null) {
                     details.put("konbini_stores", konbini.getStores());
                 }
             }
+        } 
+        else if ("bank_transfer".equals(singleUseType) && 
+                 "display_bank_transfer_instructions".equals(nextAction.getType())) {
 
-        } else if ("bank_transfer".equals(singleUseType)
-                   && "display_bank_transfer_instructions".equals(nextAction.getType())) {
-
-            final PaymentIntent.NextAction.DisplayBankTransferInstructions bankTransfer =
+            final PaymentIntent.NextAction.DisplayBankTransferInstructions bt = 
                 nextAction.getDisplayBankTransferInstructions();
 
-            if (bankTransfer != null) {
-                details.put("bank_transfer_amount_remaining", bankTransfer.getAmountRemaining());
-                details.put("bank_transfer_currency", bankTransfer.getCurrency());
-                details.put("bank_transfer_reference", bankTransfer.getReference());
-                if (bankTransfer.getHostedInstructionsUrl() != null) {
-                    details.put("bank_transfer_hosted_instructions_url", bankTransfer.getHostedInstructionsUrl());
-                }
-                if (bankTransfer.getFinancialAddresses() != null) {
-                    details.put("bank_transfer_financial_addresses", bankTransfer.getFinancialAddresses().toString());
+            if (bt != null) {
+                details.put("bank_transfer_reference", bt.getReference());
+                details.put("bank_transfer_amount_remaining", bt.getAmountRemaining());
+                details.put("bank_transfer_currency", bt.getCurrency());
+                details.put("bank_transfer_hosted_instructions_url", bt.getHostedInstructionsUrl());
+
+                if (bt.getFinancialAddresses() != null) {
+                    details.put("bank_transfer_financial_addresses", bt.getFinancialAddresses());
                 }
             }
         }

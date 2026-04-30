@@ -13,6 +13,16 @@
  * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
  * License for the specific language governing permissions and limitations
  * under the License.
+ *
+ * ======================================================================
+ * Significant modifications were subsequently made by Tenchiro LLC to
+ * support single-use payments such as konbini and bank_transfers for the
+ * Japan market.
+ *
+ * Copyright 2026 Tenchiro LLC
+ *
+ * All modifications made by Tenchiro LLC are also licensed under the
+ * Apache License, Version 2.0.
  */
 package org.killbill.billing.plugin.stripe;
 
@@ -1432,9 +1442,15 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                             // must be created unconfirmed, then confirmed separately below
                             // so Stripe generates the next_action (voucher / bank account).
                             // "customer" is required for customer_balance bank transfers.
-                            paymentIntentParams.put("payment_method_types",   StripeMethodExtensions.buildPaymentMethodTypes(singleUseType));
-                            paymentIntentParams.put("payment_method_data",    StripeMethodExtensions.buildPaymentMethodData(singleUseType));
-                            paymentIntentParams.put("payment_method_options", StripeMethodExtensions.buildPaymentMethodOptions(
+                            paymentIntentParams.put(
+                                "payment_method_types",
+                                StripeMethodExtensions.buildPaymentMethodTypes(singleUseType)
+                            );
+                            // CRITICAL: Pass the stored additional data so we can pull fullname/email
+                            paymentIntentParams.put("payment_method_data",    
+                                StripeMethodExtensions.buildPaymentMethodData(singleUseType, pmAdditionalData));
+                            paymentIntentParams.put("payment_method_options", 
+                                StripeMethodExtensions.buildPaymentMethodOptions(
                                     singleUseType, pmAdditionalData, stripeConfigProperties.getChargeDescription()));
                             paymentIntentParams.put("confirmation_method", "automatic");
                             paymentIntentParams.put("confirm",             false);
@@ -1496,7 +1512,14 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                         // These details are what the customer needs to complete payment.
                         // The confirmed intent is stored by dao.addResponse() below.
                         if (StripeMethodExtensions.requiresSpecialHandling(singleUseType)) {
-                            intent = StripeMethodExtensions.confirmIntent(intent, singleUseType, pmAdditionalData, requestOptionsWithIdempotency);
+                            // Confirm uses a DIFFERENT key — same base, different suffix
+                            // Stripe requires distinct keys per endpoint. This is to satisfy
+                            // this requirement.
+                            final RequestOptions confirmOptions = RequestOptions.builder()
+                                .setApiKey(requestOptions.getApiKey())
+                                .setIdempotencyKey(idempotencyKey + "-confirm")
+                                .build();
+                            intent = StripeMethodExtensions.confirmIntent(intent, singleUseType, pmAdditionalData, confirmOptions);
                             logger.info("Single-use PaymentIntent {} confirmed, status={}", intent.getId(), intent.getStatus());
                         }
 
