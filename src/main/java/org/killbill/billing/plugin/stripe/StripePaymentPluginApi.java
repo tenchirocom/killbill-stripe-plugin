@@ -1459,6 +1459,10 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             if ("payment_intent.succeeded".equals(event.getType())
                 || "payment_intent.payment_failed".equals(event.getType())
             ) {
+                // This is currently processing only the payment_intent status changes. It will be followed
+                // by a charge status change (payment_intent.succeeded then charge.succeeded). The payment_intent
+                // typically reflects the payment at the convenience store, while th charge is the actual
+                // charge.
                 logger.info("Payment intent succeeded...");
 
                 final PaymentIntent intent;
