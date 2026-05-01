@@ -38,6 +38,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.StreamSupport;
+import java.util.function.Supplier;
 
 import javax.annotation.Nullable;
 
@@ -1078,6 +1079,20 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
 
         if (!isHPPCompletion) {
             updateResponseWithAdditionalProperties(kbTransactionId, properties, context.getTenantId());
+
+            //
+            // Check for single-use payment method types. If this is a single-use then proceed as if
+            // it is a purchase.
+            //
+
+            // For single-use methods (konbini, bank_transfer), treat authorize like purchase
+            final String singleUseType = StripeMethodExtensions.getSingleUseType(properties);
+
+            if (StripeMethodExtensions.requiresSpecialHandling(singleUseType)) {
+                return executeInitialTransaction(TransactionType.PURCHASE, kbAccountId, kbPaymentId,
+                                                 kbTransactionId, kbPaymentMethodId, amount, currency, properties, context);
+            }
+
             return executeInitialTransaction(TransactionType.AUTHORIZE, kbAccountId, kbPaymentId,
                                              kbTransactionId, kbPaymentMethodId, amount, currency, properties, context);
         } else {
@@ -1098,12 +1113,33 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
         }
     }
 
+    /*
+     * This is the main entry point for is called by Kill Bill when you previously did an
+     * authorizePayment() (with capture_method=manual) and now want to actually capture
+     * (settle) the reserved funds.
+     */
+
     @Override
     public PaymentTransactionInfoPlugin capturePayment(final UUID kbAccountId, final UUID kbPaymentId,
                                                        final UUID kbTransactionId, final UUID kbPaymentMethodId,
                                                        final BigDecimal amount, final Currency currency,
                                                        final Iterable<PluginProperty> properties,
                                                        final CallContext context) throws PaymentPluginApiException {
+        // Single-use methods (konbini, bank_transfer) do not support a separate capture step
+        // because authorizePayment() already created them as PURCHASE
+        final String singleUseType = StripeMethodExtensions.getSingleUseType(properties);
+
+        if (StripeMethodExtensions.requiresSpecialHandling(singleUseType)) {
+            logger.info("capturePayment() called for single-use method {} - no capture needed", singleUseType);
+            
+            // getPaymentInfo returns List<PaymentTransactionInfoPlugin>
+            final List<PaymentTransactionInfoPlugin> transactions = 
+                    getPaymentInfo(kbPaymentId, kbTransactionId, properties, context);
+            
+            return transactions.stream().findFirst().orElse(null);
+        }
+
+        // Normal card capture flow
         return executeFollowUpTransaction(TransactionType.CAPTURE,
                 new TransactionExecutor<PaymentIntent>() {
                     @Override
@@ -1121,23 +1157,108 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                 kbAccountId, kbPaymentId, kbTransactionId, kbPaymentMethodId, amount, currency, properties, context);
     }
 
+    /*
+     * This is the main entry point for normal payments in KillBill. It is invoked whenever the user clicks
+     * on the equivalent of Pay Invoice, an automatic payment retry, or any time a payment transaction of
+     * type purchase is requested.
+     * 
+     * Potential Race Condition: It is possible if killbill rapidly fires repeated duplicate events, that two could
+     * get past the long-term duplication check if the previous call has already past the check, but not
+     * yet created the record. This case will be caught by the idempotent key, which lasts for a 24 hour
+     * period.
+     */
     @Override
     public PaymentTransactionInfoPlugin purchasePayment(final UUID kbAccountId, final UUID kbPaymentId,
                                                         final UUID kbTransactionId, final UUID kbPaymentMethodId,
                                                         final BigDecimal amount, final Currency currency,
                                                         final Iterable<PluginProperty> properties,
                                                         final CallContext context) throws PaymentPluginApiException {
+
+        logger.info("-+- ENTRY: purchasePayment...");
+
+        // === LONG-TERM DEDUPLICATION CHECK ===
+        // It is important not to try to create a new payment intent for invoices that already have
+        // outstanding intents. Idempotent keys only exist for 24 hours in Stripe. This is not enough
+        // for transactions that take multiple days.
+        try {
+            // Retrieve details about the most recent response record.
+            final StripeResponsesRecord existing = dao.getSuccessfulAuthorizationResponse(kbPaymentId, context.getTenantId());
+
+            logger.info("-+- CP: existing={}", existing);
+            
+            if (existing != null) {
+                // Pull the additional data from the response and check the response.
+                final Map<String, Object> data = StripeDao.fromAdditionalData(existing.getAdditionalData());
+                final String status = (String) data.get("status");
+
+                logger.info("-+- CP: status={}", status);
+
+                switch (status != null ? status : "") {
+                    case "requires_action":
+                    case "processing":
+                    case "requires_confirmation":
+                    case "requires_capture":
+                        // Still waiting for customer → reuse the same PaymentIntent
+                        //
+                        // These are all pending states that are still active. A new intent should not be
+                        // created in these cases, as the system is awaiting some kind of action. For example
+                        // a konbini payment might be waiting for the customer to make payment at the convenient
+                        // store.
+                        logger.info("Reusing active pending PaymentIntent for invoice {} (status={})", kbPaymentId, status);
+                        return buildPaymentTransactionInfoPlugin(existing);
+
+                    case "succeeded":
+                        // Already paid → do not create new one
+                        //
+                        // This is actually a potentially real case. For example if Stripe has completed the
+                        // payment, but this has not yet been synced with Killbill yet, or if there were an
+                        // error or misconfiguration in the webhook notifications.
+                        logger.info("Invoice {} already succeeded - returning existing record", kbPaymentId);
+                        return buildPaymentTransactionInfoPlugin(existing);
+
+                    // NOTE: there is a status "requires_payment_method" that could possible occur if the
+                    // payment method is a card and the card fails, i.e. for insufficient funds. It is cleaner
+                    // from the Stripe side to reuse the payment intent and attach a new method to it, or
+                    // retry it (i.e. if the bill were paid). This is rather complex, and is an edge case.
+                    // simply falling through and creating a new intent is much simpler, and the method
+                    // requiring payment method will simply expire. But the Stripe logs will be a bit less
+                    // accurate about what happened.
+
+                    default:
+                        // canceled, expired, requires_payment_method, failed, etc.
+                        logger.info("Previous attempt for invoice {} ended with status={} → allowing new attempt", 
+                                    kbPaymentId, status);
+                        // *** fall through to create new PaymentIntent ***
+                }
+            }
+        } catch (SQLException e) {
+            logger.warn("Could not check for existing transaction record", e);
+        } catch (final Exception e) {
+            logger.warn("Unexpected error during deduplication check", e);
+        }
+
+        logger.info("-+- CP: No existing...");
+
+        // No active pending intent → safe to create new one
         final StripeResponsesRecord stripeResponsesRecord;
         try {
             stripeResponsesRecord = dao.updateResponse(kbTransactionId, properties, context.getTenantId());
         } catch (final SQLException e) {
-            throw new PaymentPluginApiException("HPP notification came through, but we encountered a database error", e);
+            throw new PaymentPluginApiException("Database error while preparing transaction", e);
         }
 
+
+        logger.info("-+- CP: responseRecord={}", stripeResponsesRecord);
+
         if (stripeResponsesRecord == null) {
-            return executeInitialTransaction(TransactionType.PURCHASE, kbAccountId, kbPaymentId,
-                                             kbTransactionId, kbPaymentMethodId, amount, currency, properties, context);
+            // This is a brand new payment → create the PaymentIntent
+            return executeInitialTransaction(TransactionType.PURCHASE, 
+                                             kbAccountId, kbPaymentId, kbTransactionId, 
+                                             kbPaymentMethodId, amount, currency, properties, context
+                                            );
         }
+
+        // HPP completion or other existing response path
         return buildPaymentTransactionInfoPlugin(stripeResponsesRecord);
     }
 
@@ -1268,25 +1389,30 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
     public GatewayNotification processNotification(final String notification,
                                                 final Iterable<PluginProperty> properties,
                                                 final CallContext context) throws PaymentPluginApiException {
+        // Null event lambda supplier
+        Supplier<String> exceptionEvent = () -> {
+            return "stripe-notification-exception-event-" + System.currentTimeMillis();
+        };
 
         logger.info("Received Stripe webhook");
 
-        // The notification parameter contains the raw JSON body of the webhook
+        // Bound check: A notification event is supplied
         if (notification == null || notification.isBlank()) {
             logger.warn("Received empty webhook payload");
-            return null;
+            return new PluginGatewayNotification(exceptionEvent.get());
         }
 
+        // Extract the signature header from properties
         final String sigHeader = properties != null 
             ? PluginProperties.findPluginPropertyValue("Stripe-Signature", properties) 
             : null;
 
+        // Get the secret for signature verification
         final StripeConfigProperties config = stripeConfigPropertiesConfigurationHandler
                 .getConfigurable(context.getTenantId());
+        final String webhookSecret = config.getWebhookSecret();
 
-        final String webhookSecret = config.getWebhookSecret();   // ← you must add this to StripeConfigProperties
-
-        // When no secret is configured → signature verification is turned OFF
+        // SECURITY WARNING: if no secret is configured → signature verification is turned OFF
         if (webhookSecret == null || webhookSecret.isBlank()) {
             logger.error("=================================================================");
             logger.error("⚠️  CRITICAL: USING DEFAULT WEBHOOK SECRET (INSECURE!)");
@@ -1297,11 +1423,11 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             logger.error("=================================================================");
         }
 
-        Event event;
+        Event event = null;
 
         try {
             //
-            // SIGNATURE VERIFICATION
+            // SIGNATURE VERIFICATION & EVENT EXTRACTION
             //
             if (webhookSecret == null || webhookSecret.isBlank()) {
                 // Dev mode: skip signature verification completely
@@ -1312,32 +1438,64 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                 if (sigHeader == null) {
                     // NO SIGNATURE HEADER FOUND
                     logger.warn("STRIPE WEBHOOK IGNORED: Webhook received without Stripe-Signature header.");
-                    return null;
+                    return new PluginGatewayNotification(exceptionEvent.get());
                 }
                 // This verifies the signature and parses the event If the signature doesn't match
                 // throws a SignatureVerificationException
                 event = Webhook.constructEvent(notification, sigHeader, webhookSecret);
                 logger.info("Verified Stripe webhook event: type={} id={}", event.getType(), event.getId());
             }
+
+            // Bound check: notification contained no event
+            if (event == null) {
+                logger.warn("Failed to parse Stripe event - no event object");
+                return new PluginGatewayNotification(exceptionEvent.get());
+            }
+
             //
             // PROCESS STATUS UPDATES
             //
-            if ("payment_intent.succeeded".equals(event.getType()) ||
-                "payment_intent.payment_failed".equals(event.getType())) {
+            logger.info("Process status updates... type={}, id={}", event.getType(), event.getId());
+            if ("payment_intent.succeeded".equals(event.getType())
+                || "payment_intent.payment_failed".equals(event.getType())
+            ) {
+                logger.info("Payment intent succeeded...");
 
-                final PaymentIntent intent = (PaymentIntent) event.getDataObjectDeserializer()
-                        .getObject().orElse(null);
+                final PaymentIntent intent;
+                final var deserializer = event.getDataObjectDeserializer();
+                if (deserializer.getObject().isPresent()) {
+                    // Attempt to get the object the normal way
+                    intent = (PaymentIntent) deserializer.getObject().get();
+                } else {
+                    // API version mismatch — parse raw JSON directly
+                    try {
+                        intent = PaymentIntent.GSON.fromJson(
+                            deserializer.getRawJson(), PaymentIntent.class);
+                    } catch (Exception parseEx) {
+                        logger.error("Webhook: failed to deserialize PaymentIntent from raw JSON", parseEx);
+                        return new PluginGatewayNotification(event.getId());
+                    }
+                }
+
+                logger.info("... intent={}...", intent);
+
                 if (intent != null) {
+                    logger.info("Intent not null... status={}, id={}", intent.getStatus(), intent.getId());
+
                     try {
                         // Look up the KB transaction by Stripe PI ID and update it
                         final StripeResponsesRecord record = dao.getResponseByStripeId(intent.getId(), context.getTenantId());
                         if (record != null) {
+                            logger.info("Record not null...");
+
                             final Map<String, Object> update = new HashMap<>();
                             // Merge the latest intent state into additional_data
                             update.put("status", intent.getStatus());
                             if ("succeeded".equals(intent.getStatus())) {
+                                logger.info("intent status succeeded...");
                                 update.put(PROPERTY_OVERRIDDEN_TRANSACTION_STATUS, PaymentPluginStatus.PROCESSED.toString());
                             } else if ("canceled".equals(intent.getStatus())) {
+                                logger.info("intent status cancelled...");
                                 update.put(PROPERTY_OVERRIDDEN_TRANSACTION_STATUS, PaymentPluginStatus.ERROR.toString());
                             }
                             dao.updateResponse(record, update);
@@ -1357,7 +1515,14 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             logger.error("STRIPE WEBHOOK ERROR: Failed to process Stripe webhook", e);
         }
 
-        return null;
+        // Return a non-null notification for all cases so KillBill responds 200 to Stripe.
+        // Stripe interprets any non-2xx as a failure and will retry — we never want that
+        // for signature failures or unrecognised event types.
+        return new PluginGatewayNotification(
+            (event != null && event.getId() != null) 
+                ? event.getId() 
+                : exceptionEvent.get()
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -1584,9 +1749,17 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                     logger.info("Extracted next_action details for {}: {}", singleUseType, nextActionDetails);
                     // Update the response record with the flattened voucher/bank details
                     dao.updateResponse(responsesRecord, nextActionDetails);
-                    // Re-fetch the updated record so the plugin returns the new properties
-                    final StripeResponsesRecord updatedRecord = dao.getSuccessfulAuthorizationResponse(kbPaymentId, context.getTenantId());
-                    return StripePaymentTransactionInfoPlugin.build(updatedRecord);
+                    // Do NOT re-fetch. getSuccessfulAuthorizationResponse returns null for
+                    // PENDING payments, causing NPE → PLUGIN_FAILURE → Janitor retry →
+                    // duplicate PaymentIntent with idempotency key collision.
+                    // responsesRecord already has the correct payment ID, transaction ID,
+                    // and PENDING status. The next_action details are supplementary display
+                    // data that the Janitor will serve on the next poll.
+
+                    // Re-fetch the updated record so the plugin returns the new properties. This returns NULL for pending
+                    // konbini payments.
+                    //final StripeResponsesRecord updatedRecord = dao.getSuccessfulAuthorizationResponse(kbPaymentId, context.getTenantId());
+                    //return StripePaymentTransactionInfoPlugin.build(updatedRecord);
                 }
             }
 
