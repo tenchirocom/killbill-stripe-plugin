@@ -1536,42 +1536,6 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
         );
     }
 
-    private void notifyStateChangeX(StripeResponsesRecord record, PaymentIntent intent, Iterable<PluginProperty> properties, CallContext context) {
-        // Immediately notify KillBill to transition the payment state.
-        // This triggers KillBill to call getPaymentInfo() on this plugin right now,
-        // read the PROCESSED status we just wrote, and close the invoice.
-        // Without this, KillBill waits for the Janitor polling cycle (up to hours).
-        try {
-            final UUID kbAccountId = UUID.fromString(record.getKbAccountId());
-            final UUID kbPaymentTransactionId = UUID.fromString(record.getKbPaymentTransactionId());
-
-            final Account account = killbillAPI.getAccountUserApi()
-                    .getAccountById(kbAccountId, context);
-
-            final boolean isSuccess = "succeeded".equals(intent.getStatus());
-
-            killbillAPI.getPaymentApi().notifyPendingTransactionOfStateChanged(
-                    account,
-                    kbPaymentTransactionId,
-                    isSuccess,
-                    context);
-
-            logger.info("Webhook: notified KillBill of state change for transaction {} isSuccess={}",
-                        kbPaymentTransactionId, isSuccess);
-
-        } catch (final AccountApiException e) {
-            // Account lookup failed — Janitor will still fix this on next poll.
-            // Log as warning, not error — payment is correctly recorded in Stripe
-            // and in our response table. KillBill will eventually converge.
-            logger.warn("Webhook: could not look up account to notify state change for PI {}",
-                        intent.getId(), e);
-        } catch (final PaymentApiException e) {
-            // State transition failed — same reasoning as above.
-            logger.warn("Webhook: could not notify KillBill of state change for PI {}",
-                        intent.getId(), e);
-        }
-    }
-
     private void notifyStateChange(StripeResponsesRecord record, PaymentIntent intent, Iterable<PluginProperty> properties, CallContext context) {
         // Immediately notify KillBill to transition the payment state.
         // This triggers KillBill to call getPaymentInfo() on this plugin right now,
