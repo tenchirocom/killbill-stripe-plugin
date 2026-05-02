@@ -38,6 +38,7 @@ import org.killbill.billing.payment.api.PluginProperty;
 import org.killbill.billing.payment.api.TransactionType;
 import org.killbill.billing.plugin.api.PluginProperties;
 import org.killbill.billing.plugin.dao.payment.PluginPaymentDao;
+import org.killbill.billing.plugin.util.KillBillMoney;
 
 import com.fasterxml.jackson.annotation.JsonInclude.Include;
 
@@ -246,7 +247,7 @@ public class StripeDao extends PluginPaymentDao<StripeResponsesRecord, StripeRes
         return updateResponse(kbPaymentTransactionId, additionalProperties, kbTenantId);
     }
 
-    public StripeResponsesRecord updateResponse(final UUID kbPaymentTransactionId,
+    public StripeResponsesRecord updateResponseY(final UUID kbPaymentTransactionId,
                                                 final Map<String, Object> additionalProperties,
                                                 final UUID kbTenantId) throws SQLException {
         return execute(dataSource.getConnection(),
@@ -276,6 +277,78 @@ public class StripeDao extends PluginPaymentDao<StripeResponsesRecord, StripeRes
                                return response;
                            }
                        });
+    }
+
+    public StripeResponsesRecord updateResponse(final UUID kbPaymentTransactionId,
+                                                final Map<String, Object> additionalProperties,
+                                                final UUID kbTenantId) throws SQLException {
+        return execute(dataSource.getConnection(),
+                    new WithConnectionCallback<StripeResponsesRecord>() {
+                        @Override
+                        public StripeResponsesRecord withConnection(final Connection conn) throws SQLException {
+                            final StripeResponsesRecord response = DSL.using(conn, dialect, settings)
+                                                                        .selectFrom(STRIPE_RESPONSES)
+                                                                        .where(STRIPE_RESPONSES.KB_PAYMENT_TRANSACTION_ID.equal(kbPaymentTransactionId.toString()))
+                                                                        .and(STRIPE_RESPONSES.KB_TENANT_ID.equal(kbTenantId.toString()))
+                                                                        .orderBy(STRIPE_RESPONSES.RECORD_ID.desc())
+                                                                        .limit(1)
+                                                                        .fetchOne();
+
+                            if (response == null) {
+                                return null;
+                            }
+
+                            final Map originalData = new HashMap(fromAdditionalData(response.getAdditionalData()));
+                            originalData.putAll(additionalProperties);
+
+                            // Extract amount/currency if present in the data
+                            BigDecimal amount = response.getAmount();   // fallback from PaymentIntent
+                            String currency = response.getCurrency();
+
+                            if (originalData.containsKey("last_charge_amount")) {
+                                Long minorUnits = ((Number) originalData.get("last_charge_amount")).longValue();
+                                currency = (String) originalData.get("last_charge_currency");
+
+                                // Zero-decimal currencies (no minor units)
+                                if ("JPY".equalsIgnoreCase(currency) ||
+                                    "KRW".equalsIgnoreCase(currency) ||
+                                    "VND".equalsIgnoreCase(currency) ||
+                                    "IDR".equalsIgnoreCase(currency) ||
+                                    "CLP".equalsIgnoreCase(currency)) {
+                                    amount = new BigDecimal(minorUnits);           // NO division
+                                } else {
+                                    amount = new BigDecimal(minorUnits).divide(BigDecimal.valueOf(100));
+                                }
+                            } 
+                            else if (originalData.containsKey("amount")) {
+                                Long minorUnits = ((Number) originalData.get("amount")).longValue();
+                                currency = (String) originalData.get("currency");
+
+                                if ("JPY".equalsIgnoreCase(currency) ||
+                                    "KRW".equalsIgnoreCase(currency) ||
+                                    "VND".equalsIgnoreCase(currency) ||
+                                    "IDR".equalsIgnoreCase(currency) ||
+                                    "CLP".equalsIgnoreCase(currency)) {
+                                    amount = new BigDecimal(minorUnits);
+                                } else {
+                                    amount = new BigDecimal(minorUnits).divide(BigDecimal.valueOf(100));
+                                }
+                            }
+
+                            DSL.using(conn, dialect, settings)
+                                .update(STRIPE_RESPONSES)
+                                .set(STRIPE_RESPONSES.AMOUNT, amount)
+                                .set(STRIPE_RESPONSES.CURRENCY, currency != null ? currency.toUpperCase() : null)
+                                .set(STRIPE_RESPONSES.ADDITIONAL_DATA, asString(originalData))
+                                .where(STRIPE_RESPONSES.RECORD_ID.equal(response.getRecordId()))
+                                .execute();
+
+                            return DSL.using(conn, dialect, settings)
+                                        .selectFrom(STRIPE_RESPONSES)
+                                        .where(STRIPE_RESPONSES.RECORD_ID.equal(response.getRecordId()))
+                                        .fetchOne();
+                        }
+                    });
     }
 
     public void updateResponse(final StripeResponsesRecord stripeResponsesRecord,

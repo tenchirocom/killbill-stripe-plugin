@@ -53,6 +53,8 @@ import org.killbill.billing.payment.api.PaymentApiException;
 import org.killbill.billing.payment.api.PaymentMethodPlugin;
 import org.killbill.billing.payment.api.PluginProperty;
 import org.killbill.billing.payment.api.TransactionType;
+import org.killbill.billing.payment.api.TransactionStatus;
+import org.killbill.billing.payment.api.PaymentApi;
 import org.killbill.billing.payment.plugin.api.GatewayNotification;
 import org.killbill.billing.payment.plugin.api.HostedPaymentPageFormDescriptor;
 import org.killbill.billing.payment.plugin.api.PaymentMethodInfoPlugin;
@@ -1492,34 +1494,23 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                         // Look up the KB transaction by Stripe PI ID and update it
                         final StripeResponsesRecord record = dao.getResponseByStripeId(intent.getId(), context.getTenantId());
                         if (record != null) {
-                            logger.info("Record not null...");
-
-                            final Map<String, Object> update = new HashMap<>();
-                            // Merge the latest intent state into additional_data
-                            update.put("status", intent.getStatus());
-
-                            // Store the confirmed amount from the PaymentIntent so KillBill
-                            // applies the correct credit to the invoice when notifyPendingTransactionOfStateChanged
-                            // is called. Without this, the stored amount may be 0 from initial creation
-                            // when no charge existed yet.
-                            if (intent.getAmount() != null) {
-                                update.put("amount", intent.getAmount());
+                            Charge lastCharge = null;
+                            if (intent.getLatestCharge() != null) {
+                                try {
+                                    lastCharge = Charge.retrieve(intent.getLatestCharge(), buildRequestOptions(context));
+                                } catch (Exception e) {
+                                    logger.warn("Could not retrieve charge for PI {}", intent.getId(), e);
+                                }
                             }
-                            if (intent.getCurrency() != null) {
-                                update.put("currency", intent.getCurrency());
-                            }
+                            //
+                            // UPDATE DB
+                            //
+                            final UUID kbTransactionId = UUID.fromString(record.getKbPaymentTransactionId());
+                            StripeResponsesRecord updatedRecord = dao.updateResponse(kbTransactionId, intent, lastCharge, context.getTenantId());
 
-                            if ("succeeded".equals(intent.getStatus())) {
-                                logger.info("intent status succeeded...");
-                                update.put(PROPERTY_OVERRIDDEN_TRANSACTION_STATUS, PaymentPluginStatus.PROCESSED.toString());
-                            } else {
-                                logger.info("intent status cancelled/failed/expired: {}", intent.getStatus());
-                                update.put(PROPERTY_OVERRIDDEN_TRANSACTION_STATUS, PaymentPluginStatus.ERROR.toString());
-                            }
-                            dao.updateResponse(record, update);
                             logger.info("Webhook: updated response for PI {} → {}", intent.getId(), intent.getStatus());
 
-                            notifyStateChange(record, intent, context);
+                            notifyStateChange(updatedRecord, intent, properties, context);
                         } else {
                             logger.warn("Webhook: no response record found for PI {}", intent.getId());
                         }
@@ -1545,56 +1536,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
         );
     }
 
-    private void notifyStateChange(final StripeResponsesRecord record,
-                                final PaymentIntent intent,
-                                final CallContext context) {
-        try {
-            final UUID kbAccountId = UUID.fromString(record.getKbAccountId());
-            final UUID kbPaymentTransactionId = UUID.fromString(record.getKbPaymentTransactionId());
-            final RequestOptions requestOptions =
-                stripeConfigPropertiesConfigurationHandler
-                    .getConfigurable(context.getTenantId()).toRequestOptions();
-
-            // Fetch the actual charge so dao.updateResponse can update the
-            // amount column correctly — critical for invoice reconciliation.
-            // For konbini/bank_transfer, the charge only exists after payment.
-            Charge lastCharge = null;
-            if (intent.getLatestCharge() != null) {
-                try {
-                    lastCharge = Charge.retrieve(intent.getLatestCharge(), requestOptions);
-                } catch (final StripeException e) {
-                    logger.warn("notifyStateChange: could not retrieve charge {} for PI {}",
-                                intent.getLatestCharge(), intent.getId(), e);
-                }
-            }
-
-            // Update the full record including amount column, not just additional_data.
-            // This is the overload that dao.updateResponse(transactionId, intent, charge)
-            // uses — it writes all columns, not just JSON.
-            final UUID kbTransactionId = UUID.fromString(record.getKbPaymentTransactionId());
-            dao.updateResponse(kbTransactionId, intent, lastCharge, context.getTenantId());
-
-            // Now notify KillBill to transition state — it will call getPaymentInfo()
-            // which will read the correctly updated record.
-            final Account account = killbillAPI.getAccountUserApi()
-                    .getAccountById(kbAccountId, context);
-            final boolean isSuccess = "succeeded".equals(intent.getStatus());
-
-            killbillAPI.getPaymentApi().notifyPendingTransactionOfStateChanged(
-                    account, kbPaymentTransactionId, isSuccess, context);
-
-            logger.info("notifyStateChange: transactionId={} isSuccess={}", kbPaymentTransactionId, isSuccess);
-
-        } catch (final AccountApiException e) {
-            logger.warn("notifyStateChange: account lookup failed for PI {}", intent.getId(), e);
-        } catch (final PaymentApiException e) {
-            logger.warn("notifyStateChange: KillBill state transition failed for PI {}", intent.getId(), e);
-        } catch (final SQLException e) {
-            logger.warn("notifyStateChange: DB update failed for PI {}", intent.getId(), e);
-        }
-    }
-
-    private void notifyStateChangeX(StripeResponsesRecord record, PaymentIntent intent, CallContext context) {
+    private void notifyStateChangeX(StripeResponsesRecord record, PaymentIntent intent, Iterable<PluginProperty> properties, CallContext context) {
         // Immediately notify KillBill to transition the payment state.
         // This triggers KillBill to call getPaymentInfo() on this plugin right now,
         // read the PROCESSED status we just wrote, and close the invoice.
@@ -1623,6 +1565,38 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             // and in our response table. KillBill will eventually converge.
             logger.warn("Webhook: could not look up account to notify state change for PI {}",
                         intent.getId(), e);
+        } catch (final PaymentApiException e) {
+            // State transition failed — same reasoning as above.
+            logger.warn("Webhook: could not notify KillBill of state change for PI {}",
+                        intent.getId(), e);
+        }
+    }
+
+    private void notifyStateChange(StripeResponsesRecord record, PaymentIntent intent, Iterable<PluginProperty> properties, CallContext context) {
+        // Immediately notify KillBill to transition the payment state.
+        // This triggers KillBill to call getPaymentInfo() on this plugin right now,
+        // read the PROCESSED status we just wrote, and close the invoice.
+        // Without this, KillBill waits for the Janitor polling cycle (up to hours).
+        try {
+            final UUID kbAccountId = UUID.fromString(record.getKbAccountId());
+            final UUID kbPaymentId = UUID.fromString(record.getKbPaymentId());
+
+            // withPluginInfo=true forces KillBill to call getPaymentInfo() on this plugin,
+            // which reads the updated PROCESSED status and amount we just wrote to the DB,
+            // and triggers the full payment state machine including invoice reconciliation
+            // and account balance update. This is exactly what Kaui does when you click
+            // the payment manually.
+            killbillAPI.getPaymentApi().getPayment(
+                kbPaymentId,
+                true,   // withPluginInfo
+                false,   // withAttempts
+                Collections.emptyList(),  // pluginProperties
+                context
+            );
+
+            logger.info("Webhook: notified KillBill of state change for transaction {}",
+                        kbPaymentId);
+
         } catch (final PaymentApiException e) {
             // State transition failed — same reasoning as above.
             logger.warn("Webhook: could not notify KillBill of state change for PI {}",

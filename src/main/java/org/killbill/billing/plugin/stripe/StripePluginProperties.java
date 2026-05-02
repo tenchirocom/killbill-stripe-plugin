@@ -43,6 +43,7 @@ import com.stripe.model.Source;
 import com.stripe.model.Source.AchDebit;
 import com.stripe.model.Token;
 import com.stripe.model.checkout.Session;
+import com.stripe.model.BalanceTransaction;
 
 import static org.killbill.billing.plugin.stripe.StripePaymentPluginApi.PROPERTY_OVERRIDDEN_TRANSACTION_STATUS;
 
@@ -172,6 +173,15 @@ public abstract class StripePluginProperties {
             }
             additionalDataMap.put("last_charge_statement_descriptor", lastCharge.getStatementDescriptor());
             additionalDataMap.put("last_charge_status", lastCharge.getStatus());
+            // Additional transaction details
+            BalanceTransaction bt = lastCharge.getBalanceTransactionObject();
+            if (bt != null) {
+                additionalDataMap.put("last_charge_balance_transaction_id", bt.getId());
+                additionalDataMap.put("last_charge_balance_transaction_net", bt.getNet());
+                additionalDataMap.put("last_charge_balance_transaction_fee", bt.getFee());
+                additionalDataMap.put("last_charge_balance_transaction_amount", bt.getAmount());
+                additionalDataMap.put("last_charge_balance_transaction_currency", bt.getCurrency());
+            }
         }
 
         return additionalDataMap;
