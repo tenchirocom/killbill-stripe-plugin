@@ -45,6 +45,7 @@ import javax.annotation.Nullable;
 import org.joda.time.DateTime;
 import org.killbill.billing.ObjectType;
 import org.killbill.billing.account.api.Account;
+import org.killbill.billing.account.api.AccountApiException;
 import org.killbill.billing.catalog.api.Currency;
 import org.killbill.billing.osgi.libs.killbill.OSGIConfigPropertiesService;
 import org.killbill.billing.osgi.libs.killbill.OSGIKillbillAPI;
@@ -1458,6 +1459,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             logger.info("Process status updates... type={}, id={}", event.getType(), event.getId());
             if ("payment_intent.succeeded".equals(event.getType())
                 || "payment_intent.payment_failed".equals(event.getType())
+                || "payment_intent.canceled".equals(event.getType())
             ) {
                 // This is currently processing only the payment_intent status changes. It will be followed
                 // by a charge status change (payment_intent.succeeded then charge.succeeded). The payment_intent
@@ -1495,15 +1497,29 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                             final Map<String, Object> update = new HashMap<>();
                             // Merge the latest intent state into additional_data
                             update.put("status", intent.getStatus());
+
+                            // Store the confirmed amount from the PaymentIntent so KillBill
+                            // applies the correct credit to the invoice when notifyPendingTransactionOfStateChanged
+                            // is called. Without this, the stored amount may be 0 from initial creation
+                            // when no charge existed yet.
+                            if (intent.getAmount() != null) {
+                                update.put("amount", intent.getAmount());
+                            }
+                            if (intent.getCurrency() != null) {
+                                update.put("currency", intent.getCurrency());
+                            }
+
                             if ("succeeded".equals(intent.getStatus())) {
                                 logger.info("intent status succeeded...");
                                 update.put(PROPERTY_OVERRIDDEN_TRANSACTION_STATUS, PaymentPluginStatus.PROCESSED.toString());
-                            } else if ("canceled".equals(intent.getStatus())) {
-                                logger.info("intent status cancelled...");
+                            } else {
+                                logger.info("intent status cancelled/failed/expired: {}", intent.getStatus());
                                 update.put(PROPERTY_OVERRIDDEN_TRANSACTION_STATUS, PaymentPluginStatus.ERROR.toString());
                             }
                             dao.updateResponse(record, update);
                             logger.info("Webhook: updated response for PI {} → {}", intent.getId(), intent.getStatus());
+
+                            notifyStateChange(record, intent, context);
                         } else {
                             logger.warn("Webhook: no response record found for PI {}", intent.getId());
                         }
@@ -1527,6 +1543,91 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                 ? event.getId() 
                 : exceptionEvent.get()
         );
+    }
+
+    private void notifyStateChange(final StripeResponsesRecord record,
+                                final PaymentIntent intent,
+                                final CallContext context) {
+        try {
+            final UUID kbAccountId = UUID.fromString(record.getKbAccountId());
+            final UUID kbPaymentTransactionId = UUID.fromString(record.getKbPaymentTransactionId());
+            final RequestOptions requestOptions =
+                stripeConfigPropertiesConfigurationHandler
+                    .getConfigurable(context.getTenantId()).toRequestOptions();
+
+            // Fetch the actual charge so dao.updateResponse can update the
+            // amount column correctly — critical for invoice reconciliation.
+            // For konbini/bank_transfer, the charge only exists after payment.
+            Charge lastCharge = null;
+            if (intent.getLatestCharge() != null) {
+                try {
+                    lastCharge = Charge.retrieve(intent.getLatestCharge(), requestOptions);
+                } catch (final StripeException e) {
+                    logger.warn("notifyStateChange: could not retrieve charge {} for PI {}",
+                                intent.getLatestCharge(), intent.getId(), e);
+                }
+            }
+
+            // Update the full record including amount column, not just additional_data.
+            // This is the overload that dao.updateResponse(transactionId, intent, charge)
+            // uses — it writes all columns, not just JSON.
+            final UUID kbTransactionId = UUID.fromString(record.getKbPaymentTransactionId());
+            dao.updateResponse(kbTransactionId, intent, lastCharge, context.getTenantId());
+
+            // Now notify KillBill to transition state — it will call getPaymentInfo()
+            // which will read the correctly updated record.
+            final Account account = killbillAPI.getAccountUserApi()
+                    .getAccountById(kbAccountId, context);
+            final boolean isSuccess = "succeeded".equals(intent.getStatus());
+
+            killbillAPI.getPaymentApi().notifyPendingTransactionOfStateChanged(
+                    account, kbPaymentTransactionId, isSuccess, context);
+
+            logger.info("notifyStateChange: transactionId={} isSuccess={}", kbPaymentTransactionId, isSuccess);
+
+        } catch (final AccountApiException e) {
+            logger.warn("notifyStateChange: account lookup failed for PI {}", intent.getId(), e);
+        } catch (final PaymentApiException e) {
+            logger.warn("notifyStateChange: KillBill state transition failed for PI {}", intent.getId(), e);
+        } catch (final SQLException e) {
+            logger.warn("notifyStateChange: DB update failed for PI {}", intent.getId(), e);
+        }
+    }
+
+    private void notifyStateChangeX(StripeResponsesRecord record, PaymentIntent intent, CallContext context) {
+        // Immediately notify KillBill to transition the payment state.
+        // This triggers KillBill to call getPaymentInfo() on this plugin right now,
+        // read the PROCESSED status we just wrote, and close the invoice.
+        // Without this, KillBill waits for the Janitor polling cycle (up to hours).
+        try {
+            final UUID kbAccountId = UUID.fromString(record.getKbAccountId());
+            final UUID kbPaymentTransactionId = UUID.fromString(record.getKbPaymentTransactionId());
+
+            final Account account = killbillAPI.getAccountUserApi()
+                    .getAccountById(kbAccountId, context);
+
+            final boolean isSuccess = "succeeded".equals(intent.getStatus());
+
+            killbillAPI.getPaymentApi().notifyPendingTransactionOfStateChanged(
+                    account,
+                    kbPaymentTransactionId,
+                    isSuccess,
+                    context);
+
+            logger.info("Webhook: notified KillBill of state change for transaction {} isSuccess={}",
+                        kbPaymentTransactionId, isSuccess);
+
+        } catch (final AccountApiException e) {
+            // Account lookup failed — Janitor will still fix this on next poll.
+            // Log as warning, not error — payment is correctly recorded in Stripe
+            // and in our response table. KillBill will eventually converge.
+            logger.warn("Webhook: could not look up account to notify state change for PI {}",
+                        intent.getId(), e);
+        } catch (final PaymentApiException e) {
+            // State transition failed — same reasoning as above.
+            logger.warn("Webhook: could not notify KillBill of state change for PI {}",
+                        intent.getId(), e);
+        }
     }
 
     // -------------------------------------------------------------------------
