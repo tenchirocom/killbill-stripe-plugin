@@ -23,8 +23,10 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 import javax.annotation.Nullable;
 import javax.sql.DataSource;
@@ -392,6 +394,18 @@ public class StripeDao extends PluginPaymentDao<StripeResponsesRecord, StripeRes
                                          .fetchOne();
                            }
                        });
+    }
+
+    public StripeResponsesRecord getMostRecentResponseByInvoiceId(final UUID kbInvoiceId, final UUID kbTenantId) throws SQLException {
+        return execute(dataSource.getConnection(), conn -> {
+            return DSL.using(conn, dialect, settings)
+                    .selectFrom(STRIPE_RESPONSES)
+                    .where(STRIPE_RESPONSES.KB_INVOICE_ID.equal(kbInvoiceId.toString()))
+                    .and(STRIPE_RESPONSES.KB_TENANT_ID.equal(kbTenantId.toString()))
+                    .orderBy(STRIPE_RESPONSES.RECORD_ID.desc())
+                    .limit(1)
+                    .fetchOne(); 
+        });
     }
 
     public static Map fromAdditionalData(@Nullable final String additionalData) {

@@ -65,6 +65,7 @@ import org.killbill.billing.plugin.api.PluginProperties;
 import org.killbill.billing.plugin.api.core.PluginCustomField;
 import org.killbill.billing.plugin.api.payment.PluginHostedPaymentPageFormDescriptor;
 import org.killbill.billing.plugin.api.payment.PluginPaymentPluginApi;
+import org.killbill.billing.plugin.api.payment.PluginPaymentTransactionInfoPlugin;
 import org.killbill.billing.plugin.api.payment.PluginGatewayNotification;
 import org.killbill.billing.plugin.stripe.dao.StripeDao;
 import org.killbill.billing.plugin.stripe.dao.gen.tables.StripePaymentMethods;
@@ -1194,8 +1195,9 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                                                         final CallContext context) throws PaymentPluginApiException {
 
         logger.info("<plough> ENTRY: purchasePayment...");
-        final UUID invoiceId = getInvoiceIdFromProperties(properties);
-        logger.info("<plough> extracted invoice: id={}.", invoiceId.toString());
+        final UUID kbInvoiceId = getInvoiceIdFromProperties(properties);
+        final UUID kbTenantId = context.getTenantId();
+        logger.info("<plough> extracted invoice: id={}, tenant={}.", kbInvoiceId.toString(), kbTenantId.toString());
 
         // === LONG-TERM DEDUPLICATION CHECK ===
         // It is important not to try to create a new payment intent for invoices that already have
@@ -1203,7 +1205,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
         // for transactions that take multiple days.
         try {
             // Retrieve details about the most recent response record.
-            final StripeResponsesRecord existing = dao.getSuccessfulAuthorizationResponse(kbPaymentId, context.getTenantId());
+            final StripeResponsesRecord existing = dao.getMostRecentResponseByInvoiceId(kbInvoiceId, context.getTenantId());
 
             logger.info("<plough> CP: existing={}", existing);
             
@@ -1226,7 +1228,27 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                         // a konbini payment might be waiting for the customer to make payment at the convenient
                         // store.
                         logger.info("Reusing active pending PaymentIntent for invoice {} (status={})", kbPaymentId, status);
-                        return buildPaymentTransactionInfoPlugin(existing);
+                        //return buildPaymentTransactionInfoPlugin(existing);
+                        //throw new PaymentPluginApiException(
+                        //    "DUPLICATE_PAYMENT",
+                        //    String.format("An existing Stripe PaymentIntent awaits action for invoice %s.", kbInvoiceId.toString())
+                        //);
+                        // Return an error record instead of throwing an exception
+                        return new PluginPaymentTransactionInfoPlugin(
+                            kbPaymentId,
+                            kbTransactionId,
+                            TransactionType.PURCHASE,
+                            amount,
+                            currency,
+                            PaymentPluginStatus.CANCELED,
+                            String.format("An existing Stripe PaymentIntent awaits action for invoice %s.", kbInvoiceId.toString()),
+                            "DUPLICATE_REJECTION",
+                            "payment ref 1",
+                            "payment ref 2",
+                            context.getCreatedDate(),
+                            context.getCreatedDate(),
+                            null // additionalData
+                        );
 
                     case "succeeded":
                         // Already paid → do not create new one
@@ -1235,7 +1257,26 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                         // payment, but this has not yet been synced with Killbill yet, or if there were an
                         // error or misconfiguration in the webhook notifications.
                         logger.info("Invoice {} already succeeded - returning existing record", kbPaymentId);
-                        return buildPaymentTransactionInfoPlugin(existing);
+                        //return buildPaymentTransactionInfoPlugin(existing);
+                        //throw new PaymentPluginApiException(
+                        //    "DUPLICATE_PAYMENT",
+                        //    String.format("An existing Stripe PaymentIntent has succeeded for invoice %s.", kbInvoiceId.toString())
+                        //);
+                        return new PluginPaymentTransactionInfoPlugin(
+                            kbPaymentId,
+                            kbTransactionId,
+                            TransactionType.PURCHASE,
+                            amount,
+                            currency,
+                            PaymentPluginStatus.CANCELED,
+                            String.format("An existing Stripe PaymentIntent has already succeeded for invoice %s.", kbInvoiceId.toString()),
+                            "DUPLICATE_REJECTION",
+                            "payment ref 1",
+                            "payment ref 2",
+                            context.getCreatedDate(),
+                            context.getCreatedDate(),
+                            null // additionalData
+                        );
 
                     // NOTE: there is a status "requires_payment_method" that could possible occur if the
                     // payment method is a card and the card fails, i.e. for insufficient funds. It is cleaner
@@ -1252,6 +1293,9 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                         // *** fall through to create new PaymentIntent ***
                 }
             }
+        //} catch (PaymentPluginApiException ppae) {
+        //    // RE-THROW this so it actually stops the process!
+        //    throw ppae;
         } catch (SQLException e) {
             logger.warn("Could not check for existing transaction record", e);
         } catch (final Exception e) {
