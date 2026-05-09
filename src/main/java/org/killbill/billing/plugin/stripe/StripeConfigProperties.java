@@ -22,8 +22,10 @@
  * The following configuration must be added to the killbill configuration
  *  org.killbill.billing.plugin.stripe.webhookSecret=whsec_xxxxxxxxxxxxxxxxxxxxxxxx
  * 
- * The single-use method expiration values can be set with:
+ * The virtual method expiration values can be set with:
+ * 
  *  org.killbill.billing.plugin.stripe.pendingPaymentExpirationPeriod=konbini#P3d|bank_transfer#P4d
+ * 
  ***********************************************************************************
  */
 

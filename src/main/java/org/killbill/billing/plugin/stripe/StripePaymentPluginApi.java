@@ -83,6 +83,7 @@ import org.slf4j.LoggerFactory;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.MoreObjects;
+import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.stripe.exception.CardException;
@@ -1177,7 +1178,19 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                                                         final Iterable<PluginProperty> properties,
                                                         final CallContext context) throws PaymentPluginApiException {
 
-        logger.info("-+- ENTRY: purchasePayment...");
+        logger.info("<plough> ENTRY: purchasePayment...");
+        for (PluginProperty prop : properties) {
+            logger.info("<plough> PluginProperty: Key={}, Value={}", prop.getKey(), prop.getValue());
+        }
+        String invoiceIdStr = null;
+        for (PluginProperty prop : properties) {
+            if ("IPCD_INVOICE_ID".equals(prop.getKey())) {
+                invoiceIdStr = (String) prop.getValue();
+                break;
+            }
+        }
+        logger.info("<plough> extracted invoice: id={}.", invoiceIdStr);
+        final UUID kbInvoiceId = (invoiceIdStr != null) ? UUID.fromString(invoiceIdStr) : null;
 
         // === LONG-TERM DEDUPLICATION CHECK ===
         // It is important not to try to create a new payment intent for invoices that already have
@@ -1187,14 +1200,14 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             // Retrieve details about the most recent response record.
             final StripeResponsesRecord existing = dao.getSuccessfulAuthorizationResponse(kbPaymentId, context.getTenantId());
 
-            logger.info("-+- CP: existing={}", existing);
+            logger.info("<plough> CP: existing={}", existing);
             
             if (existing != null) {
                 // Pull the additional data from the response and check the response.
                 final Map<String, Object> data = StripeDao.fromAdditionalData(existing.getAdditionalData());
                 final String status = (String) data.get("status");
 
-                logger.info("-+- CP: status={}", status);
+                logger.info("<plough> CP: status={}", status);
 
                 switch (status != null ? status : "") {
                     case "requires_action":
@@ -1240,7 +1253,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             logger.warn("Unexpected error during deduplication check", e);
         }
 
-        logger.info("-+- CP: No existing...");
+        logger.info("<plough> CP: No existing...");
 
         // No active pending intent → safe to create new one
         final StripeResponsesRecord stripeResponsesRecord;
@@ -1251,7 +1264,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
         }
 
 
-        logger.info("-+- CP: responseRecord={}", stripeResponsesRecord);
+        logger.info("<plough> CP: responseRecord={}", stripeResponsesRecord);
 
         if (stripeResponsesRecord == null) {
             // This is a brand new payment → create the PaymentIntent
@@ -1622,12 +1635,27 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                         if (StripeVirtualPaymentMethods.requiresSpecialHandling(virtualType)
                             && StripeVirtualPaymentMethods.validateSpecialHandlingCurrency(virtualType, currency)
                         ) {
-                            throw new RuntimeException("Konbini and Bank Transfer strictly require JPY currency.");
+                            throw new RuntimeException(
+                                String.format(
+                                    "The virtual payment method '%s' does not support the currency '%s'.",
+                                    virtualType, currency
+                            ));
                         }
 
                         // ── Base params shared by both paths ────────────────────────────
                         final CaptureMethod captureMethod = transactionType == TransactionType.AUTHORIZE
                                 ? CaptureMethod.MANUAL : CaptureMethod.AUTOMATIC;
+
+                        // Extract the invoice id
+                        String kbInvoiceIdStr = null;
+                        for (PluginProperty prop : properties) {
+                            if ("IPCD_INVOICE_ID".equals(prop.getKey())) {
+                                kbInvoiceIdStr = (String) prop.getValue();
+                                break;
+                            }
+                        }
+                        logger.info("<plough> extracted invoice: id={}.", kbInvoiceIdStr);
+                        //final UUID kbInvoiceId = (invoiceIdStr != null) ? UUID.fromString(invoiceIdStr) : null;
 
                         final Map<String, Object> paymentIntentParams = new HashMap<>();
                         paymentIntentParams.put("amount",            KillBillMoney.toMinorUnits(currency.toString(), amount));
@@ -1635,15 +1663,23 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                         paymentIntentParams.put("capture_method",    captureMethod.value);
                         paymentIntentParams.put("description",       stripeConfigProperties.getChargeDescription());
                         paymentIntentParams.put("statement_descriptor_suffix", stripeConfigProperties.getChargeStatementDescriptor());
-                        paymentIntentParams.put("metadata",          ImmutableMap.of(
-                                "kbAccountId",       kbAccountId,
-                                "kbPaymentId",       kbPaymentId,
-                                "kbTransactionId",   kbTransactionId,
-                                "kbPaymentMethodId", kbPaymentMethodId));
+                        // Populate the metadata
+                        ImmutableMap.Builder<String, String> metadataBuilder = ImmutableMap.<String, String>builder()
+                            .put("kbAccountId", kbAccountId.toString())
+                            .put("kbPaymentId", kbPaymentId.toString())
+                            .put("kbTransactionId", kbTransactionId.toString())
+                            .put("kbPaymentMethodId", kbPaymentMethodId.toString());
+                        if (!Strings.isNullOrEmpty(kbInvoiceIdStr)) {
+                            // Only include if it is available
+                            metadataBuilder.put("kbInvoiceId", kbInvoiceIdStr);
+                        }
+                        paymentIntentParams.put("metadata", metadataBuilder.build());
+                        // continue...
                         if (customerId != null) {
                             paymentIntentParams.put("customer", customerId);
                         }
 
+                        // Virtual payment method handling
                         if (StripeVirtualPaymentMethods.requiresSpecialHandling(virtualType)) {
                             // ── Single-use path (konbini / bank_transfer) ────────────────
                             // Do NOT set "payment_method" or "confirm=true" here. The intent
@@ -1702,10 +1738,13 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                             paymentIntentParams.put("payment_method_types", pmTypesBuilder.build());
                         }
 
-                        // The idempotency key uses the killbill payment (invoice) id and this prevents
-                        // creating a new intent for the same invoice within a 24hour window.
-                        // Generate idempotency key from transaction ID for consistency
-                        String idempotencyKey = "kb_inv_" + kbPaymentId;
+                        // The idempotency key uses the killbill invoice id (or payment id, if not present) and this prevents
+                        // creating a new intent for the same invoice (or payment) within a 24hour window.
+                        // NOTE: If the invoice is not available, the default payment id scheme ONLY prevents duplicate payments
+                        // by the payment itself. This is actually not sufficient for important scenaries. If a payment is in
+                        // pending, and is reprocessed, kill bill initiates an entirely new payment, and thus a duplicate
+                        // will go through.
+                        String idempotencyKey = "kb_inv_" + (!Strings.isNullOrEmpty(kbInvoiceIdStr)?kbInvoiceIdStr:kbPaymentId.toString());
                         RequestOptions requestOptionsWithIdempotency = RequestOptions.builder()
                             .setApiKey(requestOptions.getApiKey())
                             .setIdempotencyKey(idempotencyKey)

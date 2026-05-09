@@ -37,6 +37,7 @@ create table stripe_responses (
 , kb_account_id char(36) not null
 , kb_payment_id char(36) not null
 , kb_payment_transaction_id char(36) not null
+, kb_invoice_id char(36)
 , transaction_type varchar(32) not null
 , amount numeric(15,9)
 , currency char(3)
