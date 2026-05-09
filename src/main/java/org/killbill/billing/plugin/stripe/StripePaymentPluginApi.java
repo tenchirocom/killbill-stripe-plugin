@@ -169,6 +169,21 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
         return null;
     }
 
+    private UUID getInvoiceIdFromProperties(final Iterable<PluginProperty> properties) {
+       
+        // Extract the invoice id
+        String invoiceIdStr = null;
+        for (PluginProperty prop : properties) {
+            if ("IPCD_INVOICE_ID".equals(prop.getKey())) {
+                invoiceIdStr = (String) prop.getValue();
+                break;
+            }
+        }
+
+        return (invoiceIdStr != null) ? UUID.fromString(invoiceIdStr) : null;
+    }
+
+
     // -------------------------------------------------------------------------
     // getPaymentInfo — Janitor polling entry point
     // -------------------------------------------------------------------------
@@ -351,7 +366,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
         // Check for Single-use method
         final String virtualType = StripeVirtualPaymentMethods.getVirtualType(allProperties);
 
-        // ── Single-use payment methods (i.e. konbini, bank_transfer) ──────────────
+        // ── Virtual payment methods (i.e. konbini, bank_transfer) ──────────────
         // These have no real Stripe PaymentMethod ID. The payment methods are created on the fly
         // for specific payments. However, the customer details (i.e. name, email, phone, ...) are
         // stored in additional_data and a sentinel stripe_id is generated so the method can be
@@ -361,7 +376,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             //
             // Add Single-Use Pseudo Payment Method
             //
-            logger.info("Registering single-use payment method '{}' for kbPaymentMethodId={}", virtualType, kbPaymentMethodId);
+            logger.info("Registering virtual payment method '{}' for kbPaymentMethodId={}", virtualType, kbPaymentMethodId);
 
             //String existingCustomerId = getCustomerIdNoException(kbAccountId, context);
             //final String customerId = ensureStripeCustomer(kbAccountId, context, requestOptions, allProperties);
@@ -1158,7 +1173,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                                 KillBillMoney.toMinorUnits(currency.toString(), amount)), requestOptions);
                     }
                 },
-                kbAccountId, kbPaymentId, kbTransactionId, kbPaymentMethodId, amount, currency, properties, context);
+                kbAccountId, kbPaymentId, kbTransactionId, kbPaymentMethodId, getInvoiceIdFromProperties(properties), amount, currency, properties, context);
     }
 
     /*
@@ -1179,18 +1194,8 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                                                         final CallContext context) throws PaymentPluginApiException {
 
         logger.info("<plough> ENTRY: purchasePayment...");
-        for (PluginProperty prop : properties) {
-            logger.info("<plough> PluginProperty: Key={}, Value={}", prop.getKey(), prop.getValue());
-        }
-        String invoiceIdStr = null;
-        for (PluginProperty prop : properties) {
-            if ("IPCD_INVOICE_ID".equals(prop.getKey())) {
-                invoiceIdStr = (String) prop.getValue();
-                break;
-            }
-        }
-        logger.info("<plough> extracted invoice: id={}.", invoiceIdStr);
-        final UUID kbInvoiceId = (invoiceIdStr != null) ? UUID.fromString(invoiceIdStr) : null;
+        final UUID invoiceId = getInvoiceIdFromProperties(properties);
+        logger.info("<plough> extracted invoice: id={}.", invoiceId.toString());
 
         // === LONG-TERM DEDUPLICATION CHECK ===
         // It is important not to try to create a new payment intent for invoices that already have
@@ -1295,7 +1300,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                         return intent.cancel(buildRequestOptions(context));
                     }
                 },
-                kbAccountId, kbPaymentId, kbTransactionId, kbPaymentMethodId, null, null, properties, context);
+                kbAccountId, kbPaymentId, kbTransactionId, kbPaymentMethodId, getInvoiceIdFromProperties(properties), null, null, properties, context);
     }
 
     @Override
@@ -1333,7 +1338,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                         return null;
                     }
                 },
-                kbAccountId, kbPaymentId, kbTransactionId, kbPaymentMethodId, amount, currency, properties, context);
+                kbAccountId, kbPaymentId, kbTransactionId, kbPaymentMethodId, getInvoiceIdFromProperties(properties), amount, currency, properties, context);
     }
 
     @VisibleForTesting
@@ -1646,16 +1651,9 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                         final CaptureMethod captureMethod = transactionType == TransactionType.AUTHORIZE
                                 ? CaptureMethod.MANUAL : CaptureMethod.AUTOMATIC;
 
-                        // Extract the invoice id
-                        String kbInvoiceIdStr = null;
-                        for (PluginProperty prop : properties) {
-                            if ("IPCD_INVOICE_ID".equals(prop.getKey())) {
-                                kbInvoiceIdStr = (String) prop.getValue();
-                                break;
-                            }
-                        }
-                        logger.info("<plough> extracted invoice: id={}.", kbInvoiceIdStr);
-                        //final UUID kbInvoiceId = (invoiceIdStr != null) ? UUID.fromString(invoiceIdStr) : null;
+                        // Extract the invoice id from properties
+                        final UUID kbInvoiceId = getInvoiceIdFromProperties(properties);
+                        logger.info("<plough> extracted invoice: id={}.", kbInvoiceId.toString());
 
                         final Map<String, Object> paymentIntentParams = new HashMap<>();
                         paymentIntentParams.put("amount",            KillBillMoney.toMinorUnits(currency.toString(), amount));
@@ -1669,9 +1667,9 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                             .put("kbPaymentId", kbPaymentId.toString())
                             .put("kbTransactionId", kbTransactionId.toString())
                             .put("kbPaymentMethodId", kbPaymentMethodId.toString());
-                        if (!Strings.isNullOrEmpty(kbInvoiceIdStr)) {
+                        if (!Strings.isNullOrEmpty(kbInvoiceId.toString())) {
                             // Only include if it is available
-                            metadataBuilder.put("kbInvoiceId", kbInvoiceIdStr);
+                            metadataBuilder.put("kbInvoiceId", kbInvoiceId.toString());
                         }
                         paymentIntentParams.put("metadata", metadataBuilder.build());
                         // continue...
@@ -1744,7 +1742,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                         // by the payment itself. This is actually not sufficient for important scenaries. If a payment is in
                         // pending, and is reprocessed, kill bill initiates an entirely new payment, and thus a duplicate
                         // will go through.
-                        String idempotencyKey = "kb_inv_" + (!Strings.isNullOrEmpty(kbInvoiceIdStr)?kbInvoiceIdStr:kbPaymentId.toString());
+                        String idempotencyKey = "kb_inv_" + (!Strings.isNullOrEmpty(kbInvoiceId.toString())?kbInvoiceId.toString():kbPaymentId.toString());
                         RequestOptions requestOptionsWithIdempotency = RequestOptions.builder()
                             .setApiKey(requestOptions.getApiKey())
                             .setIdempotencyKey(idempotencyKey)
@@ -1773,7 +1771,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                         return intent;
                     }
                 },
-                kbAccountId, kbPaymentId, kbTransactionId, kbPaymentMethodId, amount, currency, properties, context);
+                kbAccountId, kbPaymentId, kbTransactionId, kbPaymentMethodId, getInvoiceIdFromProperties(properties), amount, currency, properties, context);
     }
 
     /**
@@ -1785,6 +1783,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                                                                    final UUID kbPaymentId,
                                                                    final UUID kbTransactionId,
                                                                    final UUID kbPaymentMethodId,
+                                                                   @Nullable final UUID kbInvoiceId,
                                                                    final BigDecimal amount,
                                                                    final Currency currency,
                                                                    final Iterable<PluginProperty> properties,
@@ -1819,7 +1818,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
         try {
             final Charge lastCharge = getLastCharge(response, Collections.emptyMap(), requestOptions);
             final StripeResponsesRecord responsesRecord = dao.addResponse(kbAccountId, kbPaymentId, kbTransactionId,
-                    transactionType, amount, currency, response, lastCharge, stripeException, utcNow, context.getTenantId());
+                    transactionType, amount, currency, response, lastCharge, stripeException, utcNow, context.getTenantId(), kbInvoiceId);
 
             // Extract next_action details (vouchers, bank accounts) so the frontend can display them
             final Map<String, Object> pmAdditionalData = StripeDao.fromAdditionalData(nonNullPaymentMethodsRecord.getAdditionalData());
@@ -1857,6 +1856,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                                                                     final UUID kbPaymentId,
                                                                     final UUID kbTransactionId,
                                                                     final UUID kbPaymentMethodId,
+                                                                    @Nullable final UUID kbInvoiceId,
                                                                     @Nullable final BigDecimal amount,
                                                                     @Nullable final Currency currency,
                                                                     final Iterable<PluginProperty> properties,
@@ -1893,7 +1893,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             final Charge lastCharge = getLastCharge(response, Collections.emptyMap(), buildRequestOptions(context));
             if (lastCharge != null) {
                 final StripeResponsesRecord responsesRecord = dao.addResponse(kbAccountId, kbPaymentId, kbTransactionId,
-                        transactionType, amount, currency, response, lastCharge, stripeException, utcNow, context.getTenantId());
+                        transactionType, amount, currency, response, lastCharge, stripeException, utcNow, context.getTenantId(), kbInvoiceId);
                 return StripePaymentTransactionInfoPlugin.build(responsesRecord);
             }
             return null;

@@ -191,7 +191,8 @@ public class StripeDao extends PluginPaymentDao<StripeResponsesRecord, StripeRes
                                              @Nullable final Charge lastCharge,
                                              @Nullable final StripeException stripeException,
                                              final DateTime utcNow,
-                                             final UUID kbTenantId) throws SQLException {
+                                             final UUID kbTenantId,
+                                            @Nullable final UUID kbInvoiceId) throws SQLException {
         final Map<String, Object> additionalDataMap;
         if (stripePaymentIntent != null) {
             additionalDataMap = StripePluginProperties.toAdditionalDataMap(stripePaymentIntent, lastCharge);
@@ -214,7 +215,8 @@ public class StripeDao extends PluginPaymentDao<StripeResponsesRecord, StripeRes
                                                  STRIPE_RESPONSES.STRIPE_ID,
                                                  STRIPE_RESPONSES.ADDITIONAL_DATA,
                                                  STRIPE_RESPONSES.CREATED_DATE,
-                                                 STRIPE_RESPONSES.KB_TENANT_ID)
+                                                 STRIPE_RESPONSES.KB_TENANT_ID,
+                                                 STRIPE_RESPONSES.KB_INVOICE_ID)
                               .values(kbAccountId.toString(),
                                       kbPaymentId.toString(),
                                       kbPaymentTransactionId.toString(),
@@ -224,7 +226,8 @@ public class StripeDao extends PluginPaymentDao<StripeResponsesRecord, StripeRes
                                       stripePaymentIntent == null ? null : stripePaymentIntent.getId(),
                                       asString(additionalDataMap),
                                       toLocalDateTime(utcNow),
-                                      kbTenantId.toString())
+                                      kbTenantId.toString(),
+                                      kbInvoiceId == null ? null : kbInvoiceId.toString())
                               .execute();
                            return dslContext.fetchOne(
                                    STRIPE_RESPONSES,
