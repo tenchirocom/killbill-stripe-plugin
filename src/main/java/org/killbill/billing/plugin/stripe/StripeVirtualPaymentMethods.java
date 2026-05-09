@@ -15,14 +15,14 @@
  */
 
 /*
- * StripeMethodExtensions.java
+ * StripeVirtualPaymentMethods.java
  * ===========================
  * Package: org.killbill.billing.plugin.stripe
  *
  * PURPOSE
  * -------
- * Static utility class that extends the Stripe plugin to support single-use,
- * deferred payment methods — specifically Konbini and Bank Transfer — which
+ * Static utility class that extends the Stripe plugin to support virtual
+ * payment methods — specifically Konbini and Bank Transfer — which
  * are fundamentally incompatible with the plugin's standard card/SEPA flow.
  *
  * WHY THESE METHODS NEED SPECIAL HANDLING
@@ -31,8 +31,13 @@
  *   1. addPaymentMethod() → attaches a reusable Stripe PaymentMethod to the customer
  *   2. purchasePayment()  → creates a PaymentIntent referencing that stored PaymentMethod ID
  *   3. Result is immediate: SUCCESS or FAILED
- *
- * Konbini and bank_transfer break this model in three ways:
+ * 
+ * Kill Bill expects payment methods to be reusable. They are defined once, and then used
+ * repeatedly for payments. They are mostly immutable, with the exception of setting the
+ * default payment method, the method used automatically.
+ * 
+ * In Stripe, payment methods like Konbini and Bank Transfers are different. They break this
+ * model in some fundamental ways:
  *
  *   a) SINGLE-USE: No reusable PaymentMethod ID exists. The payment details
  *      (konbini voucher, virtual bank account) are generated fresh per transaction
@@ -49,25 +54,36 @@
  *
  * DESIGN APPROACH
  * ---------------
- * Rather than forking the plugin into separate classes, this class acts as a
- * utility layer. StripePaymentPluginApi checks at key decision points whether
- * the active payment method is a single-use type and delegates to this class
- * for the type-specific logic. All other payment paths remain unchanged.
+ * Rather than attempty to adapt the Kill Bill payment method model to include
+ * virtual, transient payment types, a 'virtual' payment type provides a
+ * persistent payment method object from which transient types can be created as
+ * necessary. Customer information necessary for the creation of these transient
+ * methods are stored as the payment method properties. When a concrete Stripe
+ * payment method is needed to complete a payment request, they are created from
+ * this information.
+ * 
+ * The StripePaymentPluginApi has been modified to intercept key decision points,
+ * determine if the active payment method is a a virtual or natural type and
+ * delegates the type-specific logic for virtual methods to this class.
+ * 
+ * The virtual method, once created, can be used the same way as a natural Stripe
+ * payment method, and all other payment paths remain unchanged.
  *
  * STORAGE SENTINEL
  * ----------------
- * Single-use methods have no real Stripe PaymentMethod ID to store in the
- * stripe_payment_methods.stripe_id column. We store a synthetic sentinel:
+ * Virtual methods have no real Stripe PaymentMethod ID to store in the
+ * stripe_payment_methods.stripe_id column. Therefore a synthetic sentinel
+ * is used:
  *
- *   "singleuse_konbini"       for Konbini
- *   "singleuse_bank_transfer" for Bank Transfer
+ *   "virtualpm_konbini"       for Konbini
+ *   "virtualpm_bank_transfer" for Bank Transfer
  *
- * This sentinel is detectable via isSingleUseStripeId(), which is used by
+ * This sentinel is detectable via isVirtualStripeId(), which is used by
  * deletePaymentMethod() and getPaymentMethods() to avoid making Stripe API
  * calls with an invalid ID.
  *
  * The actual payment credentials (name, email, phone) are stored in the
- * additional_data JSON column alongside a "single_use_type" key so they
+ * additional_data JSON column alongside a "virtualpm_type" key so they
  * can be retrieved at purchasePayment() time.
  *
  * STRIPE PAYMENT FLOW FOR EACH TYPE
@@ -123,9 +139,9 @@ import java.util.Collections;
 import java.security.SecureRandom;
 
 
-public final class StripeMethodExtensions {
+public final class StripeVirtualPaymentMethods {
 
-    private static final Logger logger = LoggerFactory.getLogger(StripeMethodExtensions.class);
+    private static final Logger logger = LoggerFactory.getLogger(StripeVirtualPaymentMethods.class);
 
     // -----------------------------------------------------------------------
     // Constants
@@ -133,7 +149,7 @@ public final class StripeMethodExtensions {
 
     /**
      * Key used in the stripe_payment_methods.additional_data JSON column to
-     * identify a single-use payment method type. This is the key that
+     * identify a virtual payment method type. This is the key that
      * StripePaymentPluginApi reads in both addPaymentMethod() and purchasePayment()
      * to determine whether special handling is needed.
      *
@@ -143,7 +159,7 @@ public final class StripeMethodExtensions {
 
     /**
      * Prefix prepended to the type key to form the sentinel stripeId stored in
-     * stripe_payment_methods.stripe_id for single-use methods.
+     * stripe_payment_methods.stripe_id for virtual methods.
      *
      * We cannot store null or empty here because the column has a NOT NULL
      * constraint and is used as an identifier in some queries. A prefixed
@@ -163,7 +179,7 @@ public final class StripeMethodExtensions {
     private static final SecureRandom RANDOM = new SecureRandom();
 
     /**
-     * The complete set of single-use payment method type keys this class handles.
+     * The complete set of virtual payment method type keys this class handles.
      * Any value in this set returned by getSingleUseType() triggers special handling
      * in addPaymentMethod(), purchasePayment(), deletePaymentMethod(), and
      * getPaymentMethods().
@@ -190,17 +206,17 @@ public final class StripeMethodExtensions {
     private static final String JP_BANK_TRANSFER_TYPE = "jp_bank_transfer";
 
     // Utility class — no instances.
-    private StripeMethodExtensions() {}
+    private StripeVirtualPaymentMethods() {}
 
     // -----------------------------------------------------------------------
     // Type detection
     // -----------------------------------------------------------------------
 
     /**
-     * Extract the single-use type from plugin properties passed to addPaymentMethod()
+     * Extract the virtual type from plugin properties passed to addPaymentMethod()
      * or any other call site where the type comes in as a PluginProperty list.
      *
-     * Returns null if no single-use type property is present, allowing the caller
+     * Returns null if no virtual type property is present, allowing the caller
      * to fall through to standard card/SEPA handling.
      *
      * @param properties  Plugin properties from the KillBill API call.
@@ -212,7 +228,7 @@ public final class StripeMethodExtensions {
     }
 
     /**
-     * Extract the single-use type from an additionalData map previously stored in
+     * Extract the virtual type from an additionalData map previously stored in
      * the stripe_payment_methods table and decoded from JSON.
      *
      * Called at purchasePayment() time, when the payment method record is retrieved
@@ -250,8 +266,8 @@ public final class StripeMethodExtensions {
      * Return true if the given type key requires special PaymentIntent handling.
      *
      * This is a guard used in StripePaymentPluginApi.executeInitialTransaction()
-     * to branch from the standard card flow into the single-use flow. A null
-     * argument (no single-use type detected) returns false, leaving the standard
+     * to branch from the standard card flow into the virtual flow. A null
+     * argument (no virtual type detected) returns false, leaving the standard
      * path unchanged.
      *
      * @param singleUseType  Value from getSingleUseType(), may be null.
@@ -269,11 +285,11 @@ public final class StripeMethodExtensions {
 
     /**
      * Return true if the given stripeId is a synthetic sentinel value for a
-     * single-use method, rather than a real Stripe PaymentMethod ID.
+     * virtual method, rather than a real Stripe PaymentMethod ID.
      *
      * Used by:
      *   deletePaymentMethod() — to skip the Stripe detach() API call.
-     *   getPaymentMethods()   — to exclude single-use records from the Stripe
+     *   getPaymentMethods()   — to exclude virtual records from the Stripe
      *                           refresh sync loop (which would otherwise delete them).
      *
      * @param stripeId  The value from stripe_payment_methods.stripe_id.
@@ -306,7 +322,7 @@ public final class StripeMethodExtensions {
     // -----------------------------------------------------------------------
 
     /**
-     * Validate and extract the additional data to store for a single-use payment
+     * Validate and extract the additional data to store for a virtual payment
      * method being registered via addPaymentMethod().
      *
      * For Konbini: requires "fullname" and "email" in properties. "phone" is optional.
@@ -392,7 +408,7 @@ public final class StripeMethodExtensions {
     // -----------------------------------------------------------------------
 
     /**
-     * Build the payment_method_types list for a single-use PaymentIntent.
+     * Build the payment_method_types list for a virtual PaymentIntent.
      *
      * Stripe uses its own naming: bank_transfer is called "customer_balance"
      * in the API. This method translates our internal type key to Stripe's name.
@@ -408,9 +424,9 @@ public final class StripeMethodExtensions {
     }
 
     /**
-     * Build the payment_method_data map for a single-use PaymentIntent.
+     * Build the payment_method_data map for a virtual PaymentIntent.
      *
-     * For single-use methods, we do not reference a stored Stripe PaymentMethod ID.
+     * For virtual methods, we do not reference a stored Stripe PaymentMethod ID.
      * Instead we pass inline payment_method_data with the type and any required
      * customer details. This is added to the PaymentIntent params at creation time.
      *
@@ -455,7 +471,7 @@ public final class StripeMethodExtensions {
     }
 
     /**
-     * Build the payment_method_options map for a single-use PaymentIntent.
+     * Build the payment_method_options map for a virtual PaymentIntent.
      *
      * Each method type has its own options block in the PaymentIntent params.
      * The stored additionalData (from addPaymentMethod()) provides customer
@@ -498,10 +514,10 @@ public final class StripeMethodExtensions {
     // -----------------------------------------------------------------------
 
     /**
-     * Confirm a newly created single-use PaymentIntent and return the confirmed
+     * Confirm a newly created virtual PaymentIntent and return the confirmed
      * PaymentIntent with next_action details populated.
      *
-     * Single-use PaymentIntents must be created with confirm=false and then
+     * virtual PaymentIntents must be created with confirm=false and then
      * explicitly confirmed. Confirmation is what triggers Stripe to generate the
      * konbini voucher code or bank transfer virtual account number, returned in
      * the PaymentIntent's next_action field.
@@ -512,7 +528,7 @@ public final class StripeMethodExtensions {
      * For Bank Transfer: no extra data needed for confirmation.
      *
      * IMPORTANT: This method must be called immediately after PaymentIntent.create()
-     * for single-use methods, before returning from executeInitialTransaction().
+     * for virtual methods, before returning from executeInitialTransaction().
      * The confirmed intent is what gets stored in stripe_responses via dao.addResponse().
      * The next_action data in the confirmed intent is what the plugin returns to KillBill
      * as transaction properties, making voucher/bank details available to the caller.
@@ -540,7 +556,7 @@ public final class StripeMethodExtensions {
         if ("succeeded".equals(intent.getStatus()) || 
             "processing".equals(intent.getStatus()) ||
             "requires_action".equals(intent.getStatus())) {
-            logger.info("[StripeMethodExtensions] PaymentIntent {} already in status {}, skipping confirmation",
+            logger.info("[StripeVirtualPaymentMethods] PaymentIntent {} already in status {}, skipping confirmation",
                         intent.getId(), intent.getStatus());
             return intent;
         }
@@ -581,18 +597,18 @@ public final class StripeMethodExtensions {
             // Stripe generates the virtual account from the customer object on the intent.
             // No extra params needed.
         } else {
-            // Defensive check: this method should only be called for known single-use types
-            logger.warn("[StripeMethodExtensions] confirmIntent called with unexpected type: {}", singleUseType);
+            // Defensive check: this method should only be called for known virtual types
+            logger.warn("[StripeVirtualPaymentMethods] confirmIntent called with unexpected type: {}", singleUseType);
         }
 
-        logger.info("[StripeMethodExtensions] Confirming {} PaymentIntent {}", singleUseType, intent.getId());
+        logger.info("[StripeVirtualPaymentMethods] Confirming {} PaymentIntent {}", singleUseType, intent.getId());
         final PaymentIntent confirmed = intent.confirm(confirmParams, requestOptions);
-        logger.info("[StripeMethodExtensions] Confirmed intent {} status={} has_next_action={}",
+        logger.info("[StripeVirtualPaymentMethods] Confirmed intent {} status={} has_next_action={}",
                     confirmed.getId(), confirmed.getStatus(), confirmed.getNextAction() != null);
         
-        // Validate that next_action was populated for single-use methods
+        // Validate that next_action was populated for virtual methods
         if (confirmed.getNextAction() == null && "requires_action".equals(confirmed.getStatus())) {
-            logger.warn("[StripeMethodExtensions] Confirmed {} intent {} has status requires_action but no next_action data",
+            logger.warn("[StripeVirtualPaymentMethods] Confirmed {} intent {} has status requires_action but no next_action data",
                         singleUseType, confirmed.getId());
         }
         
@@ -695,18 +711,18 @@ public final class StripeMethodExtensions {
 
     /**
      * Return true if the given PaymentIntent status string indicates the payment
-     * is genuinely waiting for customer action on a single-use method — as opposed
+     * is genuinely waiting for customer action on a virtual method — as opposed
      * to waiting for 3DS (which also uses "requires_action" but is handled differently).
      *
-     * For single-use methods, "requires_action" means: awaiting customer payment
+     * For virtual methods, "requires_action" means: awaiting customer payment
      * (konbini: waiting for store visit; bank_transfer: waiting for transfer arrival).
      * These should return PENDING to the Janitor so it keeps polling.
      *
      * This is used in getPaymentInfo() to avoid the 3DS confirmation path for
-     * single-use intents that happen to also use "requires_action" status.
+     * virtual intents that happen to also use "requires_action" status.
      *
      * @param status         The PaymentIntent status string from Stripe.
-     * @param singleUseType  Our internal type key, may be null for non-single-use.
+     * @param singleUseType  Our internal type key, may be null for non-virtual.
      * @return               true if this is a legitimate awaiting-customer state.
      */
     public static boolean isAwaitingCustomerAction(final String status, final String singleUseType) {
