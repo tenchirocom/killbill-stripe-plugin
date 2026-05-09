@@ -28,6 +28,7 @@ public class Indexes {
     public static final Index STRIPE_RESPONSES_STRIPE_RESPONSES_KB_PAYMENT_ID = Indexes0.STRIPE_RESPONSES_STRIPE_RESPONSES_KB_PAYMENT_ID;
     public static final Index STRIPE_RESPONSES_STRIPE_RESPONSES_KB_PAYMENT_TRANSACTION_ID = Indexes0.STRIPE_RESPONSES_STRIPE_RESPONSES_KB_PAYMENT_TRANSACTION_ID;
     public static final Index STRIPE_RESPONSES_STRIPE_RESPONSES_STRIPE_ID = Indexes0.STRIPE_RESPONSES_STRIPE_RESPONSES_STRIPE_ID;
+    public static final Index STRIPE_RESPONSES_STRIPE_RESPONSES_KB_INVOICE_ID = Indexes0.STRIPE_RESPONSES_STRIPE_RESPONSES_KB_INVOICE_ID;
 
     // -------------------------------------------------------------------------
     // [#1459] distribute members to avoid static initialisers > 64kb
@@ -40,5 +41,6 @@ public class Indexes {
         public static Index STRIPE_RESPONSES_STRIPE_RESPONSES_KB_PAYMENT_ID = Internal.createIndex("stripe_responses_kb_payment_id", StripeResponses.STRIPE_RESPONSES, new OrderField[] { StripeResponses.STRIPE_RESPONSES.KB_PAYMENT_ID }, false);
         public static Index STRIPE_RESPONSES_STRIPE_RESPONSES_KB_PAYMENT_TRANSACTION_ID = Internal.createIndex("stripe_responses_kb_payment_transaction_id", StripeResponses.STRIPE_RESPONSES, new OrderField[] { StripeResponses.STRIPE_RESPONSES.KB_PAYMENT_TRANSACTION_ID }, false);
         public static Index STRIPE_RESPONSES_STRIPE_RESPONSES_STRIPE_ID = Internal.createIndex("stripe_responses_stripe_id", StripeResponses.STRIPE_RESPONSES, new OrderField[] { StripeResponses.STRIPE_RESPONSES.STRIPE_ID }, false);
+        public static Index STRIPE_RESPONSES_STRIPE_RESPONSES_KB_INVOICE_ID = Internal.createIndex("stripe_responses_kb_invoice_id", StripeResponses.STRIPE_RESPONSES, new OrderField[] { StripeResponses.STRIPE_RESPONSES.KB_INVOICE_ID }, false);
     }
 }

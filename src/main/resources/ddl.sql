@@ -37,7 +37,6 @@ create table stripe_responses (
 , kb_account_id char(36) not null
 , kb_payment_id char(36) not null
 , kb_payment_transaction_id char(36) not null
-, kb_invoice_id char(36)
 , transaction_type varchar(32) not null
 , amount numeric(15,9)
 , currency char(3)
@@ -45,11 +44,13 @@ create table stripe_responses (
 , additional_data longtext default null
 , created_date datetime not null
 , kb_tenant_id char(36) not null
+, kb_invoice_id char(36)
 , primary key(record_id)
 ) /*! CHARACTER SET utf8 COLLATE utf8_bin */;
 create index stripe_responses_kb_payment_id on stripe_responses(kb_payment_id);
 create index stripe_responses_kb_payment_transaction_id on stripe_responses(kb_payment_transaction_id);
 create index stripe_responses_stripe_id on stripe_responses(stripe_id);
+create index stripe_responses_kb_invoice_id on stripe_responses(kb_invoice_id);
 
 create table stripe_payment_methods (
   record_id serial

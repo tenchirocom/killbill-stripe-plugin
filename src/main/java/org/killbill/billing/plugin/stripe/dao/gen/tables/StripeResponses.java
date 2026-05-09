@@ -15,7 +15,7 @@ import org.jooq.Identity;
 import org.jooq.Index;
 import org.jooq.Name;
 import org.jooq.Record;
-import org.jooq.Row11;
+import org.jooq.Row12;
 import org.jooq.Schema;
 import org.jooq.Table;
 import org.jooq.TableField;
@@ -107,6 +107,11 @@ public class StripeResponses extends TableImpl<StripeResponsesRecord> {
     public final TableField<StripeResponsesRecord, String> KB_TENANT_ID = createField(DSL.name("kb_tenant_id"), org.jooq.impl.SQLDataType.CHAR(36).nullable(false), this, "");
 
     /**
+     * The column <code>killbill.stripe_responses.kb_invoice_id</code>.
+     */
+    public final TableField<StripeResponsesRecord, String> KB_INVOICE_ID = createField(DSL.name("kb_invoice_id"), org.jooq.impl.SQLDataType.CHAR(36).nullable(true), this, "");
+
+    /**
      * Create a <code>killbill.stripe_responses</code> table reference
      */
     public StripeResponses() {
@@ -146,7 +151,7 @@ public class StripeResponses extends TableImpl<StripeResponsesRecord> {
 
     @Override
     public List<Index> getIndexes() {
-        return Arrays.<Index>asList(Indexes.STRIPE_RESPONSES_STRIPE_RESPONSES_KB_PAYMENT_ID, Indexes.STRIPE_RESPONSES_STRIPE_RESPONSES_KB_PAYMENT_TRANSACTION_ID, Indexes.STRIPE_RESPONSES_STRIPE_RESPONSES_STRIPE_ID);
+        return Arrays.<Index>asList(Indexes.STRIPE_RESPONSES_STRIPE_RESPONSES_KB_PAYMENT_ID, Indexes.STRIPE_RESPONSES_STRIPE_RESPONSES_KB_PAYMENT_TRANSACTION_ID, Indexes.STRIPE_RESPONSES_STRIPE_RESPONSES_STRIPE_ID, Indexes.STRIPE_RESPONSES_STRIPE_RESPONSES_KB_INVOICE_ID);
     }
 
     @Override
@@ -191,11 +196,11 @@ public class StripeResponses extends TableImpl<StripeResponsesRecord> {
     }
 
     // -------------------------------------------------------------------------
-    // Row11 type methods
+    // Row12 type methods
     // -------------------------------------------------------------------------
 
     @Override
-    public Row11<ULong, String, String, String, String, BigDecimal, String, String, String, LocalDateTime, String> fieldsRow() {
-        return (Row11) super.fieldsRow();
+    public Row12<ULong, String, String, String, String, BigDecimal, String, String, String, LocalDateTime, String, String> fieldsRow() {
+        return (Row12) super.fieldsRow();
     }
 }
