@@ -159,7 +159,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
      *
      * "customer_balance" is Stripe's name for our "bank_transfer" type.
      */
-    private String getSingleUseTypeFromIntent(final PaymentIntent intent) {
+    private String getVirtualTypeFromIntent(final PaymentIntent intent) {
         final List<String> types = intent.getPaymentMethodTypes();
         if (types != null) {
             if (types.contains("konbini"))          return "konbini";
@@ -217,9 +217,9 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                     // Detect whether this is a single-use method (konbini / bank_transfer).
                     // We read from the live intent's payment_method_types because the payment
                     // method record is not easily available here.
-                    final String singleUseType = getSingleUseTypeFromIntent(intent);
+                    final String virtualType = getVirtualTypeFromIntent(intent);
 
-                    if (StripeVirtualPaymentMethods.isAwaitingCustomerAction(intent.getStatus(), singleUseType)) {
+                    if (StripeVirtualPaymentMethods.isAwaitingCustomerAction(intent.getStatus(), virtualType)) {
                         // Single-use PENDING = legitimately waiting for the customer to pay
                         // at the store or complete the bank transfer. Do NOT treat this as a
                         // 3DS flow — do not confirm, do not cancel. Just refresh the stored
@@ -348,7 +348,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
         final Iterable<PluginProperty> allProperties = PluginProperties.merge(paymentMethodProps.getProperties(), properties);
 
         // Check for Single-use method
-        final String singleUseType = StripeVirtualPaymentMethods.getSingleUseType(allProperties);
+        final String virtualType = StripeVirtualPaymentMethods.getVirtualType(allProperties);
 
         // ── Single-use payment methods (i.e. konbini, bank_transfer) ──────────────
         // These have no real Stripe PaymentMethod ID. The payment methods are created on the fly
@@ -356,11 +356,11 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
         // stored in additional_data and a sentinel stripe_id is generated so the method can be
         // uniquely identified and distinguished from real Stripe object.
 
-        if (singleUseType != null) {
+        if (virtualType != null) {
             //
             // Add Single-Use Pseudo Payment Method
             //
-            logger.info("Registering single-use payment method '{}' for kbPaymentMethodId={}", singleUseType, kbPaymentMethodId);
+            logger.info("Registering single-use payment method '{}' for kbPaymentMethodId={}", virtualType, kbPaymentMethodId);
 
             //String existingCustomerId = getCustomerIdNoException(kbAccountId, context);
             //final String customerId = ensureStripeCustomer(kbAccountId, context, requestOptions, allProperties);
@@ -393,13 +393,13 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
 
             final Map<String, Object> additionalData;
             try {
-                additionalData = StripeVirtualPaymentMethods.buildStoredMethodData(singleUseType, allProperties, requestOptions, existingCustomerId);
+                additionalData = StripeVirtualPaymentMethods.buildStoredMethodData(virtualType, allProperties, requestOptions, existingCustomerId);
             } catch (final IllegalArgumentException e) {
                 throw new PaymentPluginApiException("USER", e.getMessage());
             }
             try {
                 dao.addPaymentMethod(kbAccountId, kbPaymentMethodId, additionalData,
-                                     StripeVirtualPaymentMethods.buildSentinelStripeId(singleUseType),
+                                     StripeVirtualPaymentMethods.buildSentinelStripeId(virtualType),
                                      clock.getUTCNow(), context.getTenantId());
             } catch (final SQLException e) {
                 throw new PaymentPluginApiException("Failed to save single-use payment method", e);
@@ -869,7 +869,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
         }
 
         // Skip Stripe API calls for single-use methods. This can be done locally.
-        if (StripeVirtualPaymentMethods.isSingleUseStripeId(stripePaymentMethodsRecord.getStripeId())) {
+        if (StripeVirtualPaymentMethods.isVirtualStripeId(stripePaymentMethodsRecord.getStripeId())) {
             logger.info("Deleting single-use payment method {} - no Stripe API call needed", kbPaymentMethodId);
             super.deletePaymentMethod(kbAccountId, kbPaymentMethodId, properties, context);
             return;
@@ -954,7 +954,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
         final Map<String, StripePaymentMethodsRecord> existingPaymentMethodByStripeId = new HashMap<>();
         try {
             for (final StripePaymentMethodsRecord record : dao.getPaymentMethods(kbAccountId, context.getTenantId())) {
-                if (StripeVirtualPaymentMethods.isSingleUseStripeId(record.getStripeId())) {
+                if (StripeVirtualPaymentMethods.isVirtualStripeId(record.getStripeId())) {
                     continue; // Managed locally; never sync'd against Stripe
                 }
                 existingPaymentMethodByStripeId.put(record.getStripeId(), record);
@@ -1089,9 +1089,9 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             //
 
             // For single-use methods (konbini, bank_transfer), treat authorize like purchase
-            final String singleUseType = StripeVirtualPaymentMethods.getSingleUseType(properties);
+            final String virtualType = StripeVirtualPaymentMethods.getVirtualType(properties);
 
-            if (StripeVirtualPaymentMethods.requiresSpecialHandling(singleUseType)) {
+            if (StripeVirtualPaymentMethods.requiresSpecialHandling(virtualType)) {
                 return executeInitialTransaction(TransactionType.PURCHASE, kbAccountId, kbPaymentId,
                                                  kbTransactionId, kbPaymentMethodId, amount, currency, properties, context);
             }
@@ -1130,10 +1130,10 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                                                        final CallContext context) throws PaymentPluginApiException {
         // Single-use methods (konbini, bank_transfer) do not support a separate capture step
         // because authorizePayment() already created them as PURCHASE
-        final String singleUseType = StripeVirtualPaymentMethods.getSingleUseType(properties);
+        final String virtualType = StripeVirtualPaymentMethods.getVirtualType(properties);
 
-        if (StripeVirtualPaymentMethods.requiresSpecialHandling(singleUseType)) {
-            logger.info("capturePayment() called for single-use method {} - no capture needed", singleUseType);
+        if (StripeVirtualPaymentMethods.requiresSpecialHandling(virtualType)) {
+            logger.info("capturePayment() called for single-use method {} - no capture needed", virtualType);
             
             // getPaymentInfo returns List<PaymentTransactionInfoPlugin>
             final List<PaymentTransactionInfoPlugin> transactions = 
@@ -1608,19 +1608,19 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                                 stripeConfigPropertiesConfigurationHandler.getConfigurable(context.getTenantId());
 
                         // ── Read stored payment method data and detect type ──────────────
-                        // IMPORTANT: singleUseType MUST be determined before building any
+                        // IMPORTANT: virtualType MUST be determined before building any
                         // payment_method or payment_method_types params. These two paths are
                         // mutually exclusive and must not be mixed.
                         final Map<String, Object> pmAdditionalData =
                                 StripeDao.fromAdditionalData(paymentMethodsRecord.getAdditionalData());
-                        final String singleUseType = StripeVirtualPaymentMethods.getSingleUseType(pmAdditionalData);
+                        final String virtualType = StripeVirtualPaymentMethods.getVirtualType(pmAdditionalData);
 
                         // Check currency. These methods are for Japan market only
                         // Verify: Is this strictly true? Are there any other markets/currencies that have these methods too? If so,
                         // this check requires modification to check all currencies. Currency.JPY should be replaced by a mehtod
                         // call to verify valid currency.
-                        if (StripeVirtualPaymentMethods.requiresSpecialHandling(singleUseType)
-                            && StripeVirtualPaymentMethods.validateSpecialHandlingCurrency(singleUseType, currency)
+                        if (StripeVirtualPaymentMethods.requiresSpecialHandling(virtualType)
+                            && StripeVirtualPaymentMethods.validateSpecialHandlingCurrency(virtualType, currency)
                         ) {
                             throw new RuntimeException("Konbini and Bank Transfer strictly require JPY currency.");
                         }
@@ -1644,7 +1644,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                             paymentIntentParams.put("customer", customerId);
                         }
 
-                        if (StripeVirtualPaymentMethods.requiresSpecialHandling(singleUseType)) {
+                        if (StripeVirtualPaymentMethods.requiresSpecialHandling(virtualType)) {
                             // ── Single-use path (konbini / bank_transfer) ────────────────
                             // Do NOT set "payment_method" or "confirm=true" here. The intent
                             // must be created unconfirmed, then confirmed separately below
@@ -1652,14 +1652,14 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                             // "customer" is required for customer_balance bank transfers.
                             paymentIntentParams.put(
                                 "payment_method_types",
-                                StripeVirtualPaymentMethods.buildPaymentMethodTypes(singleUseType)
+                                StripeVirtualPaymentMethods.buildPaymentMethodTypes(virtualType)
                             );
                             // CRITICAL: Pass the stored additional data so we can pull fullname/email
                             paymentIntentParams.put("payment_method_data",    
-                                StripeVirtualPaymentMethods.buildPaymentMethodData(singleUseType, pmAdditionalData));
+                                StripeVirtualPaymentMethods.buildPaymentMethodData(virtualType, pmAdditionalData));
                             paymentIntentParams.put("payment_method_options", 
                                 StripeVirtualPaymentMethods.buildPaymentMethodOptions(
-                                    singleUseType, pmAdditionalData, stripeConfigProperties.getChargeDescription()));
+                                    virtualType, pmAdditionalData, stripeConfigProperties.getChargeDescription()));
                             paymentIntentParams.put("confirmation_method", "automatic");
                             paymentIntentParams.put("confirm",             false);
 
@@ -1711,7 +1711,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                             .setIdempotencyKey(idempotencyKey)
                             .build();
                         // ── Create the PaymentIntent ─────────────────────────────────────
-                        logger.info("Creating Stripe PaymentIntent (type={})", singleUseType != null ? singleUseType : "card");
+                        logger.info("Creating Stripe PaymentIntent (type={})", virtualType != null ? virtualType : "card");
                         PaymentIntent intent = PaymentIntent.create(paymentIntentParams, requestOptionsWithIdempotency);
 
                         // ── Confirm single-use intents to generate next_action details ───
@@ -1719,7 +1719,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                         // For bank_transfer: next_action.display_bank_transfer_instructions
                         // These details are what the customer needs to complete payment.
                         // The confirmed intent is stored by dao.addResponse() below.
-                        if (StripeVirtualPaymentMethods.requiresSpecialHandling(singleUseType)) {
+                        if (StripeVirtualPaymentMethods.requiresSpecialHandling(virtualType)) {
                             // Confirm uses a DIFFERENT key — same base, different suffix
                             // Stripe requires distinct keys per endpoint. This is to satisfy
                             // this requirement.
@@ -1727,7 +1727,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                                 .setApiKey(requestOptions.getApiKey())
                                 .setIdempotencyKey(idempotencyKey + "-confirm")
                                 .build();
-                            intent = StripeVirtualPaymentMethods.confirmIntent(intent, singleUseType, pmAdditionalData, confirmOptions);
+                            intent = StripeVirtualPaymentMethods.confirmIntent(intent, virtualType, pmAdditionalData, confirmOptions);
                             logger.info("Single-use PaymentIntent {} confirmed, status={}", intent.getId(), intent.getStatus());
                         }
 
@@ -1784,12 +1784,12 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
 
             // Extract next_action details (vouchers, bank accounts) so the frontend can display them
             final Map<String, Object> pmAdditionalData = StripeDao.fromAdditionalData(nonNullPaymentMethodsRecord.getAdditionalData());
-            final String singleUseType = StripeVirtualPaymentMethods.getSingleUseType(pmAdditionalData);
+            final String virtualType = StripeVirtualPaymentMethods.getVirtualType(pmAdditionalData);
             
-            if (StripeVirtualPaymentMethods.requiresSpecialHandling(singleUseType)) {
-                final Map<String, Object> nextActionDetails = StripeVirtualPaymentMethods.extractNextActionDetails(response, singleUseType);
+            if (StripeVirtualPaymentMethods.requiresSpecialHandling(virtualType)) {
+                final Map<String, Object> nextActionDetails = StripeVirtualPaymentMethods.extractNextActionDetails(response, virtualType);
                 if (!nextActionDetails.isEmpty()) {
-                    logger.info("Extracted next_action details for {}: {}", singleUseType, nextActionDetails);
+                    logger.info("Extracted next_action details for {}: {}", virtualType, nextActionDetails);
                     // Update the response record with the flattened voucher/bank details
                     dao.updateResponse(responsesRecord, nextActionDetails);
                     // Do NOT re-fetch. getSuccessfulAuthorizationResponse returns null for

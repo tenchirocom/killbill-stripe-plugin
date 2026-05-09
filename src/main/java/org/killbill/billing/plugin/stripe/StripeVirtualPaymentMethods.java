@@ -163,9 +163,9 @@ public final class StripeVirtualPaymentMethods {
      *
      * We cannot store null or empty here because the column has a NOT NULL
      * constraint and is used as an identifier in some queries. A prefixed
-     * sentinel is detectable by isSingleUseStripeId() and is safe to store.
+     * sentinel is detectable by isVirtualStripeId() and is safe to store.
      */
-    public static final String SINGLE_USE_STRIPE_ID_PREFIX = "singleuse_";
+    public static final String VIRTUAL_STRIPE_ID_PREFIX = "virtualpm_";
 
     /**
      * The allowable characters used in the random string postfixed to the single use
@@ -180,11 +180,11 @@ public final class StripeVirtualPaymentMethods {
 
     /**
      * The complete set of virtual payment method type keys this class handles.
-     * Any value in this set returned by getSingleUseType() triggers special handling
+     * Any value in this set returned by getVirtualType() triggers special handling
      * in addPaymentMethod(), purchasePayment(), deletePaymentMethod(), and
      * getPaymentMethods().
      */
-    public static final Set<String> SINGLE_USE_TYPES = ImmutableSet.of("konbini", "bank_transfer");
+    public static final Set<String> VIRTUAL_TYPES = ImmutableSet.of("konbini", "bank_transfer");
 
     /**
      * Stripe's internal type identifier for bank transfers via customer balance.
@@ -222,9 +222,9 @@ public final class StripeVirtualPaymentMethods {
      * @param properties  Plugin properties from the KillBill API call.
      * @return            The type key ("konbini", "bank_transfer"), or null.
      */
-    public static String getSingleUseType(final Iterable<PluginProperty> properties) {
+    public static String getVirtualType(final Iterable<PluginProperty> properties) {
         final String value = PluginProperties.findPluginPropertyValue(METHOD_TYPE, properties);
-        return SINGLE_USE_TYPES.contains(value) ? value : null;
+        return VIRTUAL_TYPES.contains(value) ? value : null;
     }
 
     /**
@@ -237,22 +237,22 @@ public final class StripeVirtualPaymentMethods {
      * @param additionalData Deserialized additional_data map from the DB record.
      * @return The type key ("konbini", "bank_transfer"), or null.
      */
-    public static String getSingleUseType(final Map<String, Object> additionalData) {
+    public static String getVirtualType(final Map<String, Object> additionalData) {
         if (additionalData == null) {
             return null;
         }
 
-        // Primary method: look for the explicit single_use_type key
+        // Primary method: look for the explicit virtualpm_type key
         final Object value = additionalData.get(METHOD_TYPE);
-        if (value instanceof String && SINGLE_USE_TYPES.contains(value)) {
+        if (value instanceof String && VIRTUAL_TYPES.contains(value)) {
             return (String) value;
         }
 
         // Fallback: try to extract from sentinel stripe_id (in case additional_data is incomplete)
         final String stripeId = (String) additionalData.get("id");
-        if (stripeId != null && stripeId.startsWith(SINGLE_USE_STRIPE_ID_PREFIX)) {
-            // e.g. singleuse_konbini_1TKsXURWcYTdjAvFKxEWr585
-            for (String type : SINGLE_USE_TYPES) {
+        if (stripeId != null && stripeId.startsWith(VIRTUAL_STRIPE_ID_PREFIX)) {
+            // e.g. virtualpm_konbini_1TKsXURWcYTdjAvFKxEWr585
+            for (String type : VIRTUAL_TYPES) {
                 if (stripeId.contains("_" + type + "_")) {
                     return type;
                 }
@@ -270,15 +270,15 @@ public final class StripeVirtualPaymentMethods {
      * argument (no virtual type detected) returns false, leaving the standard
      * path unchanged.
      *
-     * @param singleUseType  Value from getSingleUseType(), may be null.
+     * @param virtualType  Value from getVirtualType(), may be null.
      * @return               true if special handling is needed.
      */
-    public static boolean requiresSpecialHandling(final String singleUseType) {
-        return singleUseType != null && SINGLE_USE_TYPES.contains(singleUseType);
+    public static boolean requiresSpecialHandling(final String virtualType) {
+        return virtualType != null && VIRTUAL_TYPES.contains(virtualType);
     }
 
-    public static boolean validateSpecialHandlingCurrency(final String singleUseType, final Currency currency) {
-        // **FIX** Improve this by refining the test for each singleUseType in the event that special methods
+    public static boolean validateSpecialHandlingCurrency(final String virtualType, final Currency currency) {
+        // **FIX** Improve this by refining the test for each virtualType in the event that special methods
         // that apply to other currencies are automatically supported.
         return currency != Currency.JPY;
     }
@@ -295,26 +295,26 @@ public final class StripeVirtualPaymentMethods {
      * @param stripeId  The value from stripe_payment_methods.stripe_id.
      * @return          true if this is a sentinel ID, not a real Stripe ID.
      */
-    public static boolean isSingleUseStripeId(final String stripeId) {
+    public static boolean isVirtualStripeId(final String stripeId) {
         if (stripeId == null) {
             return false;
         }
-        return stripeId.startsWith(SINGLE_USE_STRIPE_ID_PREFIX);
+        return stripeId.startsWith(VIRTUAL_STRIPE_ID_PREFIX);
     }
 
     /**
      * Build the sentinel stripeId for storage in stripe_payment_methods.stripe_id.
      *
-     * @param singleUseType  The type key ("konbini", "bank_transfer").
-     * @return               The sentinel string, e.g. "singleuse_konbini".
+     * @param virtualType  The type key ("konbini", "bank_transfer").
+     * @return               The sentinel string, e.g. "virtualpm_konbini".
      */
-    public static String buildSentinelStripeId(final String singleUseType) {
+    public static String buildSentinelStripeId(final String virtualType) {
         StringBuilder sb = new StringBuilder(24);
 
         for (int i = 0; i < 24; i++) {
             sb.append(ID_ALPHABET.charAt(RANDOM.nextInt(ID_ALPHABET.length())));
         }
-        return SINGLE_USE_STRIPE_ID_PREFIX + singleUseType + "_" + sb.toString();
+        return VIRTUAL_STRIPE_ID_PREFIX + virtualType + "_" + sb.toString();
     }
 
     // -----------------------------------------------------------------------
@@ -331,26 +331,26 @@ public final class StripeVirtualPaymentMethods {
      * The returned map is stored as JSON in stripe_payment_methods.additional_data.
      * It will be retrieved by purchasePayment() to populate the PaymentIntent.
      *
-     * @param singleUseType  The type key, already validated by getSingleUseType().
+     * @param virtualType  The type key, already validated by getVirtualType().
      * @param properties     Plugin properties from addPaymentMethod() call.
      * @return               A map ready for storage in additional_data.
      * @throws IllegalArgumentException if required fields are missing.
      */
     public static Map<String, Object> buildStoredMethodData(
-        final String singleUseType,
+        final String virtualType,
         final Iterable<PluginProperty> properties,
         final RequestOptions requestOptions,
         final String customer_id
     ) {
         final Map<String, Object> data = new HashMap<>();
-        // Always store the type so getSingleUseType(Map) can detect it later.
-        data.put("type", singleUseType);
+        // Always store the type so getVirtualType(Map) can detect it later.
+        data.put("type", virtualType);
         data.put("object", "payment_method");
         data.put("customer_id", customer_id);
         data.put("livemode", isLiveMode(requestOptions.getApiKey()));
         data.put("created", System.currentTimeMillis() / 1000);
 
-        if ("konbini".equals(singleUseType)) {
+        if ("konbini".equals(virtualType)) {
             // Required
             final String name  = PluginProperties.findPluginPropertyValue("fullname", properties);
             final String email = PluginProperties.findPluginPropertyValue("email", properties);
@@ -375,7 +375,7 @@ public final class StripeVirtualPaymentMethods {
                 data.put("phone", phone);
             }
 
-        } else if ("bank_transfer".equals(singleUseType)) {
+        } else if ("bank_transfer".equals(virtualType)) {
             // Required
             final String email = PluginProperties.findPluginPropertyValue("email", properties);
             if (email == null || email.isBlank()) {
@@ -413,14 +413,14 @@ public final class StripeVirtualPaymentMethods {
      * Stripe uses its own naming: bank_transfer is called "customer_balance"
      * in the API. This method translates our internal type key to Stripe's name.
      *
-     * @param singleUseType  Our internal type key.
+     * @param virtualType  Our internal type key.
      * @return               A list containing Stripe's payment method type string.
      */
-    public static List<String> buildPaymentMethodTypes(final String singleUseType) {
-        if ("bank_transfer".equals(singleUseType)) {
+    public static List<String> buildPaymentMethodTypes(final String virtualType) {
+        if ("bank_transfer".equals(virtualType)) {
             return List.of(STRIPE_BANK_TRANSFER_TYPE);
         }
-        return List.of(singleUseType); // "konbini" maps directly to "konbini" in Stripe
+        return List.of(virtualType); // "konbini" maps directly to "konbini" in Stripe
     }
 
     /**
@@ -432,12 +432,12 @@ public final class StripeVirtualPaymentMethods {
      *
      * For bank_transfer, Stripe's type name for this field is "customer_balance".
      *
-     * @param singleUseType  Our internal type key.
+     * @param virtualType  Our internal type key.
      * @return               A map for the "payment_method_data" parameter.
      */
-    public static Map<String, Object> buildPaymentMethodData(final String singleUseType,
+    public static Map<String, Object> buildPaymentMethodData(final String virtualType,
                                                              final Map<String, Object> additionalData) {
-        if ("konbini".equals(singleUseType)) {
+        if ("konbini".equals(virtualType)) {
             Map<String, Object> billingDetails = new HashMap<>();
 
             billingDetails.put("name",  additionalData.get("fullname"));
@@ -453,7 +453,7 @@ public final class StripeVirtualPaymentMethods {
             );
         }
 
-        if ("bank_transfer".equals(singleUseType)) {
+        if ("bank_transfer".equals(virtualType)) {
             // Bank transfer (customer_balance) is very minimal
             // email is useful but not strictly required by Stripe API
             Map<String, Object> data = new HashMap<>();
@@ -477,18 +477,18 @@ public final class StripeVirtualPaymentMethods {
      * The stored additionalData (from addPaymentMethod()) provides customer
      * details that must be included here.
      *
-     * @param singleUseType  Our internal type key.
+     * @param virtualType  Our internal type key.
      * @param storedData     The additionalData map from the payment method DB record.
      *                       Contains name, email, phone stored at registration time.
      * @param description    The charge description from StripeConfigProperties.
      * @return               A map for the "payment_method_options" parameter.
      */
     public static Map<String, Object> buildPaymentMethodOptions(
-        final String singleUseType,
+        final String virtualType,
         final Map<String, Object> storedData,
         final String description
     ) {
-        if ("konbini".equals(singleUseType)) {
+        if ("konbini".equals(virtualType)) {
             // product_description is required for konbini. It appears on the
             // voucher shown at the convenience store terminal.
             return ImmutableMap.of(
@@ -497,7 +497,7 @@ public final class StripeVirtualPaymentMethods {
                     "expires_after_days",  KONBINI_EXPIRES_AFTER_DAYS
                 )
             );
-        } else if ("bank_transfer".equals(singleUseType)) {
+        } else if ("bank_transfer".equals(virtualType)) {
             // jp_bank_transfer uses Furikomi/Zengin rails.
             return ImmutableMap.of(
                 "customer_balance", ImmutableMap.of(
@@ -536,7 +536,7 @@ public final class StripeVirtualPaymentMethods {
      * @param intent         The freshly created, unconfirmed PaymentIntent.
      *                       Status at this point is typically "requires_payment_method"
      *                       or "requires_confirmation".
-     * @param singleUseType  Our internal type key.
+     * @param virtualType  Our internal type key.
      * @param storedData     The additionalData from the payment method record,
      *                       containing customer details stored at registration time.
      * @param requestOptions Stripe request options (API key, timeouts).
@@ -547,7 +547,7 @@ public final class StripeVirtualPaymentMethods {
      */
     public static PaymentIntent confirmIntent(
         final PaymentIntent intent,
-        final String singleUseType,
+        final String virtualType,
         final Map<String, Object> storedData,
         final RequestOptions requestOptions
     ) throws StripeException {
@@ -563,7 +563,7 @@ public final class StripeVirtualPaymentMethods {
 
         final Map<String, Object> confirmParams = new HashMap<>();
 
-        if ("konbini".equals(singleUseType)) {
+        if ("konbini".equals(virtualType)) {
             // Customer name is required at confirmation time for konbini.
             // It appears on the payment receipt at the convenience store.
             final String customerName = storedData != null
@@ -592,16 +592,16 @@ public final class StripeVirtualPaymentMethods {
                 )
             ));
 
-        } else if ("bank_transfer".equals(singleUseType)) {
+        } else if ("bank_transfer".equals(virtualType)) {
             // Bank transfer confirmation does not require additional customer data —
             // Stripe generates the virtual account from the customer object on the intent.
             // No extra params needed.
         } else {
             // Defensive check: this method should only be called for known virtual types
-            logger.warn("[StripeVirtualPaymentMethods] confirmIntent called with unexpected type: {}", singleUseType);
+            logger.warn("[StripeVirtualPaymentMethods] confirmIntent called with unexpected type: {}", virtualType);
         }
 
-        logger.info("[StripeVirtualPaymentMethods] Confirming {} PaymentIntent {}", singleUseType, intent.getId());
+        logger.info("[StripeVirtualPaymentMethods] Confirming {} PaymentIntent {}", virtualType, intent.getId());
         final PaymentIntent confirmed = intent.confirm(confirmParams, requestOptions);
         logger.info("[StripeVirtualPaymentMethods] Confirmed intent {} status={} has_next_action={}",
                     confirmed.getId(), confirmed.getStatus(), confirmed.getNextAction() != null);
@@ -609,7 +609,7 @@ public final class StripeVirtualPaymentMethods {
         // Validate that next_action was populated for virtual methods
         if (confirmed.getNextAction() == null && "requires_action".equals(confirmed.getStatus())) {
             logger.warn("[StripeVirtualPaymentMethods] Confirmed {} intent {} has status requires_action but no next_action data",
-                        singleUseType, confirmed.getId());
+                        virtualType, confirmed.getId());
         }
         
         return confirmed;
@@ -635,12 +635,12 @@ public final class StripeVirtualPaymentMethods {
      *
      * @param intent         A confirmed PaymentIntent. May have null nextAction
      *                       if the intent was created in a terminal state.
-     * @param singleUseType  Our internal type key.
+     * @param virtualType  Our internal type key.
      * @return               A flat map of key→value strings for storage.
      */
     public static Map<String, Object> extractNextActionDetails(
             final PaymentIntent intent,
-            final String singleUseType) {
+            final String virtualType) {
 
         final Map<String, Object> details = new HashMap<>();
 
@@ -650,7 +650,7 @@ public final class StripeVirtualPaymentMethods {
 
         final PaymentIntent.NextAction nextAction = intent.getNextAction();
 
-        if ("konbini".equals(singleUseType) && 
+        if ("konbini".equals(virtualType) && 
             "konbini_display_details".equals(nextAction.getType())) {
 
             final PaymentIntent.NextAction.KonbiniDisplayDetails konbini = 
@@ -669,7 +669,7 @@ public final class StripeVirtualPaymentMethods {
                 }
             }
         } 
-        else if ("bank_transfer".equals(singleUseType) && 
+        else if ("bank_transfer".equals(virtualType) && 
                  "display_bank_transfer_instructions".equals(nextAction.getType())) {
 
             final PaymentIntent.NextAction.DisplayBankTransferInstructions bt = 
@@ -722,10 +722,10 @@ public final class StripeVirtualPaymentMethods {
      * virtual intents that happen to also use "requires_action" status.
      *
      * @param status         The PaymentIntent status string from Stripe.
-     * @param singleUseType  Our internal type key, may be null for non-virtual.
+     * @param virtualType  Our internal type key, may be null for non-virtual.
      * @return               true if this is a legitimate awaiting-customer state.
      */
-    public static boolean isAwaitingCustomerAction(final String status, final String singleUseType) {
-        return requiresSpecialHandling(singleUseType) && "requires_action".equals(status);
+    public static boolean isAwaitingCustomerAction(final String status, final String virtualType) {
+        return requiresSpecialHandling(virtualType) && "requires_action".equals(status);
     }
 }

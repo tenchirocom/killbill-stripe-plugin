@@ -128,9 +128,9 @@ public class ExpiredPaymentPolicy {
     private String getPaymentMethod(final Map stripeResponseAdditionalData) {
         // Single-use methods (konbini / bank_transfer) store their type in additional_data
         // via StripeVirtualPaymentMethods. Use it first so the per-method config works.
-        final String singleUseType = StripeVirtualPaymentMethods.getSingleUseType(stripeResponseAdditionalData);
-        if (singleUseType != null) {
-            return singleUseType;   // returns "konbini" or "bank_transfer" — exactly matches config keys
+        final String virtualType = StripeVirtualPaymentMethods.getVirtualType(stripeResponseAdditionalData);
+        if (virtualType != null) {
+            return virtualType;   // returns "konbini" or "bank_transfer" — exactly matches config keys
         }
 
         // Normal card / SEPA / US bank account path (unchanged)
