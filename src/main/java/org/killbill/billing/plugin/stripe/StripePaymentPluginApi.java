@@ -87,6 +87,8 @@ import com.google.common.base.MoreObjects;
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonElement;
 import com.stripe.exception.CardException;
 import com.stripe.exception.StripeException;
 import com.stripe.exception.SignatureVerificationException;
@@ -421,6 +423,9 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             } catch (final SQLException e) {
                 throw new PaymentPluginApiException("Failed to save single-use payment method", e);
             }
+            //
+            // Because these are virtual methods, no actual stripe api is called at this point.
+            //
             return; // Do not fall through to standard Stripe PM creation
         }
 
@@ -1520,16 +1525,19 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             //
             // PROCESS STATUS UPDATES
             //
-            logger.info("Process status updates... type={}, id={}", event.getType(), event.getId());
-            if ("payment_intent.succeeded".equals(event.getType())
-                || "payment_intent.payment_failed".equals(event.getType())
-                || "payment_intent.canceled".equals(event.getType())
+            final String eventType = event.getType();
+            logger.info("<plough> Process status updates... type={}, id={}", eventType, event.getId());
+            if ("payment_intent.succeeded".equals(eventType)
+                || "payment_intent.payment_failed".equals(eventType)
+                || "payment_intent.canceled".equals(eventType)
+                || "payment_intent.partially_funded".equals(eventType)
+
             ) {
                 // This is currently processing only the payment_intent status changes. It will be followed
                 // by a charge status change (payment_intent.succeeded then charge.succeeded). The payment_intent
                 // typically reflects the payment at the convenience store, while th charge is the actual
                 // charge.
-                logger.info("Payment intent succeeded...");
+                logger.info("<plough> Payment intent processing event_type='{}'...", eventType);
 
                 final PaymentIntent intent;
                 final var deserializer = event.getDataObjectDeserializer();
@@ -1547,10 +1555,18 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                     }
                 }
 
-                logger.info("... intent={}...", intent);
+                logger.info("... <plough> intent={}...", intent);
 
                 if (intent != null) {
-                    logger.info("Intent not null... status={}, id={}", intent.getStatus(), intent.getId());
+                    logger.info("<plough> Intent not null... status={}, id={}", intent.getStatus(), intent.getId());
+
+                    // PARTIAL FUNDING:
+                    // Partial funding is a special case for bank transfers: some funds have arrived
+                    // but the full amount has not been received yet. The PaymentIntent remains in
+                    // requires_action state. The DB record is upated with the partial amount for
+                    // display purposes, but we must NOT trigger notifyStateChange — the invoice
+                    // must remain open until full payment arrives.
+                    final boolean isPartialFunding = "payment_intent.partially_funded".equals(eventType);
 
                     try {
                         // Look up the KB transaction by Stripe PI ID and update it
@@ -1564,15 +1580,73 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                                     logger.warn("Could not retrieve charge for PI {}", intent.getId(), e);
                                 }
                             }
+
                             //
                             // UPDATE DB
                             //
                             final UUID kbTransactionId = UUID.fromString(record.getKbPaymentTransactionId());
                             StripeResponsesRecord updatedRecord = dao.updateResponse(kbTransactionId, intent, lastCharge, context.getTenantId());
 
-                            logger.info("Webhook: updated response for PI {} → {}", intent.getId(), intent.getStatus());
+                            if (isPartialFunding) {
+                                // PARTIAL FUNDING SCENARIO
 
-                            notifyStateChange(updatedRecord, intent, properties, context);
+                                // Store partial funding details in additional_data so the
+                                // Django application can surface them to the customer
+                                // (e.g. "We received ¥3,000 of your ¥5,000 transfer").
+                                // Do NOT call notifyStateChange — the payment remains PENDING.
+
+                                // Access the customer_balance payment method options
+                                JsonObject rawJson = intent.getRawJsonObject();
+
+                                if (rawJson != null && rawJson.has("payment_method_options")) {
+                                    JsonElement paymentMethodOptionsElement = rawJson.get("payment_method_options");
+                                    
+                                    if (paymentMethodOptionsElement != null && paymentMethodOptionsElement.isJsonObject()) {
+                                        JsonObject paymentMethodOptions = paymentMethodOptionsElement.getAsJsonObject();
+                                        
+                                        if (paymentMethodOptions.has("customer_balance")) {
+                                            JsonElement customerBalanceElement = paymentMethodOptions.get("customer_balance");
+                                            
+                                            if (customerBalanceElement != null && customerBalanceElement.isJsonObject()) {
+                                                JsonObject customerBalance = customerBalanceElement.getAsJsonObject();
+                                                
+                                                // Extract the values safely
+                                                Long amountReceived = customerBalance.has("amount_received") && !customerBalance.get("amount_received").isJsonNull()
+                                                    ? customerBalance.get("amount_received").getAsLong() 
+                                                    : 0L;
+                                                    
+                                                Long amountRemaining = customerBalance.has("amount_remaining") && !customerBalance.get("amount_remaining").isJsonNull()
+                                                    ? customerBalance.get("amount_remaining").getAsLong() 
+                                                    : 0L;
+                                                
+                                                if (amountReceived > 0) {
+                                                    // Partial funding scenario
+                                                    final Map<String, Object> partialData = new HashMap<>();
+                                                    partialData.put("amount_received", amountReceived);
+                                                    partialData.put("amount_remaining", amountRemaining);
+                                                    partialData.put("partial_funding_event_id", event.getId());
+                                                    
+                                                    dao.updateResponse(updatedRecord, partialData);
+                                                    
+                                                    logger.info("Webhook: <plough> partial bank transfer received for PI {} — "
+                                                            + "received={} of {} {}. Payment remains PENDING.",
+                                                            intent.getId(),
+                                                            amountReceived,
+                                                            intent.getAmount(),
+                                                            intent.getCurrency().toUpperCase());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                // FULL FUNDING SCENARIO
+                                
+                                // Succeeded, failed, or canceled — trigger full state reconciliation.
+                                notifyStateChange(updatedRecord, intent, properties, context);
+                                logger.info("Webhook: <plough> updated response for PI {} → {}",
+                                        intent.getId(), intent.getStatus());
+                            }
                         } else {
                             logger.warn("Webhook: no response record found for PI {}", intent.getId());
                         }
@@ -1723,11 +1797,13 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
 
                         // Virtual payment method handling
                         if (StripeVirtualPaymentMethods.requiresSpecialHandling(virtualType)) {
-                            // ── Single-use path (konbini / bank_transfer) ────────────────
+
+                            // ── Virtual payment method path (konbini / bank_transfer) ────────────────
                             // Do NOT set "payment_method" or "confirm=true" here. The intent
                             // must be created unconfirmed, then confirmed separately below
                             // so Stripe generates the next_action (voucher / bank account).
                             // "customer" is required for customer_balance bank transfers.
+
                             paymentIntentParams.put(
                                 "payment_method_types",
                                 StripeVirtualPaymentMethods.buildPaymentMethodTypes(virtualType)
@@ -1786,6 +1862,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                         // by the payment itself. This is actually not sufficient for important scenaries. If a payment is in
                         // pending, and is reprocessed, kill bill initiates an entirely new payment, and thus a duplicate
                         // will go through.
+
                         String idempotencyKey = "kb_inv_" + (!Strings.isNullOrEmpty(kbInvoiceId.toString())?kbInvoiceId.toString():kbPaymentId.toString());
                         RequestOptions requestOptionsWithIdempotency = RequestOptions.builder()
                             .setApiKey(requestOptions.getApiKey())
@@ -1795,11 +1872,12 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                         logger.info("Creating Stripe PaymentIntent (type={})", virtualType != null ? virtualType : "card");
                         PaymentIntent intent = PaymentIntent.create(paymentIntentParams, requestOptionsWithIdempotency);
 
-                        // ── Confirm single-use intents to generate next_action details ───
+                        // ── Confirm single-use virtual method intents to generate next_action details ───
                         // For konbini: next_action.konbini_display_details.confirmation_number
                         // For bank_transfer: next_action.display_bank_transfer_instructions
                         // These details are what the customer needs to complete payment.
                         // The confirmed intent is stored by dao.addResponse() below.
+
                         if (StripeVirtualPaymentMethods.requiresSpecialHandling(virtualType)) {
                             // Confirm uses a DIFFERENT key — same base, different suffix
                             // Stripe requires distinct keys per endpoint. This is to satisfy

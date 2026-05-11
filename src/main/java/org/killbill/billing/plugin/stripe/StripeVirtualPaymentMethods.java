@@ -459,10 +459,8 @@ public final class StripeVirtualPaymentMethods {
             Map<String, Object> data = new HashMap<>();
             data.put("type", "customer_balance");
 
-            // Optional: you can still pass email if you have it
-            if (additionalData.containsKey("email")) {
-                data.put("email", additionalData.get("email"));
-            }
+            // Do not include any unrecognized/unsupported values or the Stripe
+            // api will fail...
 
             return data;
         }
