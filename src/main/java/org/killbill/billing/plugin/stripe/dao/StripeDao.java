@@ -33,11 +33,9 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
-import java.util.stream.Collectors;
 
 import javax.annotation.Nullable;
 import javax.sql.DataSource;
@@ -45,13 +43,11 @@ import javax.sql.DataSource;
 import org.joda.time.DateTime;
 import org.jooq.DSLContext;
 import org.jooq.impl.DSL;
-import org.jooq.SQLDialect;
 import org.killbill.billing.catalog.api.Currency;
 import org.killbill.billing.payment.api.PluginProperty;
 import org.killbill.billing.payment.api.TransactionType;
 import org.killbill.billing.plugin.api.PluginProperties;
 import org.killbill.billing.plugin.dao.payment.PluginPaymentDao;
-import org.killbill.billing.plugin.util.KillBillMoney;
 
 import com.fasterxml.jackson.annotation.JsonInclude.Include;
 
