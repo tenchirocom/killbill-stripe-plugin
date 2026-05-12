@@ -88,6 +88,7 @@ import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.gson.JsonObject;
+import com.google.gson.Gson;
 import com.google.gson.JsonElement;
 import com.stripe.exception.CardException;
 import com.stripe.exception.StripeException;
@@ -1477,9 +1478,12 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             ? PluginProperties.findPluginPropertyValue("Stripe-Signature", properties) 
             : null;
 
+        // Extract tenant id from context
+        UUID kbTenantId = context.getTenantId();
+
         // Get the secret for signature verification
         final StripeConfigProperties config = stripeConfigPropertiesConfigurationHandler
-                .getConfigurable(context.getTenantId());
+                .getConfigurable(kbTenantId);
         final String webhookSecret = config.getWebhookSecret();
 
         // SECURITY WARNING: if no secret is configured → signature verification is turned OFF
@@ -1523,14 +1527,15 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             }
 
             //
-            // PROCESS STATUS UPDATES
+            // PROCESS PAYMENT UPDATES
             //
             final String eventType = event.getType();
+            final boolean isPartialFunding = "payment_intent.partially_funded".equals(eventType);
             logger.info("<plough> Process status updates... type={}, id={}", eventType, event.getId());
             if ("payment_intent.succeeded".equals(eventType)
                 || "payment_intent.payment_failed".equals(eventType)
                 || "payment_intent.canceled".equals(eventType)
-                || "payment_intent.partially_funded".equals(eventType)
+                || isPartialFunding
 
             ) {
                 // This is currently processing only the payment_intent status changes. It will be followed
@@ -1557,101 +1562,90 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
 
                 logger.info("... <plough> intent={}...", intent);
 
+                // Guard: ensure event is carrying a valid intent
                 if (intent != null) {
-                    logger.info("<plough> Intent not null... status={}, id={}", intent.getStatus(), intent.getId());
-
-                    // PARTIAL FUNDING:
-                    // Partial funding is a special case for bank transfers: some funds have arrived
-                    // but the full amount has not been received yet. The PaymentIntent remains in
-                    // requires_action state. The DB record is upated with the partial amount for
-                    // display purposes, but we must NOT trigger notifyStateChange — the invoice
-                    // must remain open until full payment arrives.
-                    final boolean isPartialFunding = "payment_intent.partially_funded".equals(eventType);
+                    final String intentId = intent.getId();
+                    logger.info("<plough> Intent not null... status={}, id={}", intent.getStatus(), intentId);
 
                     try {
-                        // Look up the KB transaction by Stripe PI ID and update it
-                        final StripeResponsesRecord record = dao.getResponseByStripeId(intent.getId(), context.getTenantId());
-                        if (record != null) {
+                        // DB Lookup: get transaction by Stripe PI ID and update it
+                        final StripeResponsesRecord record = dao.getResponseByStripeId(intentId, kbTenantId);
+
+                        logger.info("<plough> CHECKPOINT-1 ... record={}", record);
+                        // Guard: ensure valid record retrieved
+                        if (record == null) {
+                            logger.warn("Stripe Webhook: no response record found for PI {}", intentId);
+                        } else {
+                            //
+                            // UPDATE RESPONSE
+                            //
+                            logger.info("<plough> CHECKPOINT-2 ...");
                             Charge lastCharge = null;
                             if (intent.getLatestCharge() != null) {
                                 try {
                                     lastCharge = Charge.retrieve(intent.getLatestCharge(), buildRequestOptions(context));
                                 } catch (Exception e) {
-                                    logger.warn("Could not retrieve charge for PI {}", intent.getId(), e);
+                                    logger.warn("Could not retrieve charge for PI {}", intentId, e);
                                 }
                             }
 
-                            //
-                            // UPDATE DB
-                            //
+                            logger.info("<plough> CHECKPOINT-3 ... lastCharge={}", lastCharge);
+
+                            // Update DB
                             final UUID kbTransactionId = UUID.fromString(record.getKbPaymentTransactionId());
-                            StripeResponsesRecord updatedRecord = dao.updateResponse(kbTransactionId, intent, lastCharge, context.getTenantId());
+                            // Updates the response with the intent data
+                            StripeResponsesRecord updatedRecord = dao.updateResponse(kbTransactionId, intent, lastCharge, kbTenantId);
+
+                            logger.info("<plough> CHECKPOINT-4 ... updateRecord={}", updatedRecord);
+
+                            // PARTIAL FUNDING
+                            //
+                            // Partial funding is a special case that particularly affects Japan bank transfers.
+                            // Some funds have arrived, but the full amount has not been received yet. The PaymentIntent
+                            // remains in requires_action state. The DB record is upated with the partial amount for
+                            // the user experience, but we do NOT trigger notifyStateChange — the invoice remains unpaid
+                            // and open until full funding arrives.
 
                             if (isPartialFunding) {
                                 // PARTIAL FUNDING SCENARIO
 
-                                // Store partial funding details in additional_data so the
-                                // Django application can surface them to the customer
-                                // (e.g. "We received ¥3,000 of your ¥5,000 transfer").
-                                // Do NOT call notifyStateChange — the payment remains PENDING.
-
-                                // Access the customer_balance payment method options
-                                JsonObject rawJson = intent.getRawJsonObject();
-
-                                if (rawJson != null && rawJson.has("payment_method_options")) {
-                                    JsonElement paymentMethodOptionsElement = rawJson.get("payment_method_options");
-                                    
-                                    if (paymentMethodOptionsElement != null && paymentMethodOptionsElement.isJsonObject()) {
-                                        JsonObject paymentMethodOptions = paymentMethodOptionsElement.getAsJsonObject();
-                                        
-                                        if (paymentMethodOptions.has("customer_balance")) {
-                                            JsonElement customerBalanceElement = paymentMethodOptions.get("customer_balance");
-                                            
-                                            if (customerBalanceElement != null && customerBalanceElement.isJsonObject()) {
-                                                JsonObject customerBalance = customerBalanceElement.getAsJsonObject();
-                                                
-                                                // Extract the values safely
-                                                Long amountReceived = customerBalance.has("amount_received") && !customerBalance.get("amount_received").isJsonNull()
-                                                    ? customerBalance.get("amount_received").getAsLong() 
-                                                    : 0L;
-                                                    
-                                                Long amountRemaining = customerBalance.has("amount_remaining") && !customerBalance.get("amount_remaining").isJsonNull()
-                                                    ? customerBalance.get("amount_remaining").getAsLong() 
-                                                    : 0L;
-                                                
-                                                if (amountReceived > 0) {
-                                                    // Partial funding scenario
-                                                    final Map<String, Object> partialData = new HashMap<>();
-                                                    partialData.put("amount_received", amountReceived);
-                                                    partialData.put("amount_remaining", amountRemaining);
-                                                    partialData.put("partial_funding_event_id", event.getId());
-                                                    
-                                                    dao.updateResponse(updatedRecord, partialData);
-                                                    
-                                                    logger.info("Webhook: <plough> partial bank transfer received for PI {} — "
-                                                            + "received={} of {} {}. Payment remains PENDING.",
-                                                            intent.getId(),
-                                                            amountReceived,
-                                                            intent.getAmount(),
-                                                            intent.getCurrency().toUpperCase());
-                                                }
-                                            }
-                                        }
-                                    }
+                                logger.info("<plough> CHECKPOINT-6 use intent directly");
+                                
+                                // amount_remaining is inside next_action.display_bank_transfer_instructions
+                                Long amountRemaining = 0L;
+                                PaymentIntent.NextAction nextAction = intent.getNextAction();
+                                if (nextAction != null && nextAction.getDisplayBankTransferInstructions() != null) {
+                                    amountRemaining = nextAction.getDisplayBankTransferInstructions().getAmountRemaining();
                                 }
+
+                                Long amountReceived = intent.getAmount() - amountRemaining;
+                                
+                                logger.info("<plough> CHECKPOINT-7 amount_received={}, amount_remaining={}", amountReceived, amountRemaining);
+                                
+                                final Map<String, Object> partialData = new HashMap<>();
+                                partialData.put("amount_funded", amountReceived);
+                                //partialData.put("amount_remaining", amountRemaining);
+                                partialData.put("partial_funding_event_id", event.getId());
+                                
+                                dao.updateResponse(kbTransactionId, partialData, kbTenantId);
+                                
+                                logger.info("Webhook: partial bank transfer received for PI {} — "
+                                        + "received={} of {} {}. Payment remains PENDING.",
+                                        intentId,
+                                        amountReceived,
+                                        intent.getAmount(),
+                                        intent.getCurrency().toUpperCase());
                             } else {
                                 // FULL FUNDING SCENARIO
                                 
                                 // Succeeded, failed, or canceled — trigger full state reconciliation.
                                 notifyStateChange(updatedRecord, intent, properties, context);
-                                logger.info("Webhook: <plough> updated response for PI {} → {}",
-                                        intent.getId(), intent.getStatus());
+                                logger.info("Stripe Webhook: <plough> updated response for PI {} → {}",
+                                        intentId, intent.getStatus());
                             }
-                        } else {
-                            logger.warn("Webhook: no response record found for PI {}", intent.getId());
                         }
                     } catch (final SQLException e) {
-                        logger.error("Webhook: DB error updating response for PI {}", intent.getId(), e);
+                        logger.error("Webhook: DB error updating response for PI {}", intentId, e);
                     }
                     return new PluginGatewayNotification(event.getId());
                 }

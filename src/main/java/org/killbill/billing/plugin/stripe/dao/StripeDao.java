@@ -252,38 +252,6 @@ public class StripeDao extends PluginPaymentDao<StripeResponsesRecord, StripeRes
         return updateResponse(kbPaymentTransactionId, additionalProperties, kbTenantId);
     }
 
-    public StripeResponsesRecord updateResponseY(final UUID kbPaymentTransactionId,
-                                                final Map<String, Object> additionalProperties,
-                                                final UUID kbTenantId) throws SQLException {
-        return execute(dataSource.getConnection(),
-                       new WithConnectionCallback<StripeResponsesRecord>() {
-                           @Override
-                           public StripeResponsesRecord withConnection(final Connection conn) throws SQLException {
-                               final StripeResponsesRecord response = DSL.using(conn, dialect, settings)
-                                                                         .selectFrom(STRIPE_RESPONSES)
-                                                                         .where(STRIPE_RESPONSES.KB_PAYMENT_TRANSACTION_ID.equal(kbPaymentTransactionId.toString()))
-                                                                         .and(STRIPE_RESPONSES.KB_TENANT_ID.equal(kbTenantId.toString()))
-                                                                         .orderBy(STRIPE_RESPONSES.RECORD_ID.desc())
-                                                                         .limit(1)
-                                                                         .fetchOne();
-
-                               if (response == null) {
-                                   return null;
-                               }
-
-                               final Map originalData = new HashMap(fromAdditionalData(response.getAdditionalData()));
-                               originalData.putAll(additionalProperties);
-
-                               DSL.using(conn, dialect, settings)
-                                  .update(STRIPE_RESPONSES)
-                                  .set(STRIPE_RESPONSES.ADDITIONAL_DATA, asString(originalData))
-                                  .where(STRIPE_RESPONSES.RECORD_ID.equal(response.getRecordId()))
-                                  .execute();
-                               return response;
-                           }
-                       });
-    }
-
     public StripeResponsesRecord updateResponse(final UUID kbPaymentTransactionId,
                                                 final Map<String, Object> additionalProperties,
                                                 final UUID kbTenantId) throws SQLException {
@@ -373,6 +341,33 @@ public class StripeDao extends PluginPaymentDao<StripeResponsesRecord, StripeRes
                         return null;
                     }
                 });
+    }
+
+    public void updatePartialPayment(final StripeResponsesRecord stripeResponsesRecord, 
+                                    final BigDecimal amountReceived, 
+                                    final BigDecimal amountRemaining, 
+                                    final String eventId, 
+                                    final UUID kbTenantId) throws SQLException {
+        execute(dataSource.getConnection(), conn -> {
+            DSLContext dsl = DSL.using(conn, dialect, settings);
+            
+            if (stripeResponsesRecord != null) {
+                Map<String, Object> currentData = new HashMap<>(fromAdditionalData(stripeResponsesRecord.getAdditionalData()));
+                
+                // 2. Put your partial details
+                currentData.put("amount_received", amountReceived);
+                currentData.put("amount_remaining", amountRemaining);
+                currentData.put("partial_funding_event_id", eventId);
+                currentData.put("updated", toLocalDateTime(DateTime.now()));
+
+                // 3. Perform the update using the explicit Record ID
+                dsl.update(STRIPE_RESPONSES)
+                .set(STRIPE_RESPONSES.ADDITIONAL_DATA, asString(currentData))
+                .where(STRIPE_RESPONSES.RECORD_ID.eq(stripeResponsesRecord.getRecordId()))
+                .execute();
+            }
+            return null;
+        });
     }
 
     @Override
