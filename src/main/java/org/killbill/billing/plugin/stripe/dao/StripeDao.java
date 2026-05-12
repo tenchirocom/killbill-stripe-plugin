@@ -50,6 +50,7 @@ import org.killbill.billing.plugin.api.PluginProperties;
 import org.killbill.billing.plugin.dao.payment.PluginPaymentDao;
 
 import com.fasterxml.jackson.annotation.JsonInclude.Include;
+import com.fasterxml.jackson.core.type.TypeReference;
 
 import org.killbill.billing.plugin.stripe.StripePluginProperties;
 import org.killbill.billing.plugin.stripe.dao.gen.tables.StripePaymentMethods;
@@ -264,7 +265,7 @@ public class StripeDao extends PluginPaymentDao<StripeResponsesRecord, StripeRes
     }
 
     public StripeResponsesRecord updateResponse(final UUID kbPaymentTransactionId,
-                                                final Map<String, Object> additionalProperties,
+                                                final Map<String, ? extends Object> additionalProperties,
                                                 final UUID kbTenantId) throws SQLException {
         return execute(dataSource.getConnection(),
                     new WithConnectionCallback<StripeResponsesRecord>() {
@@ -298,7 +299,6 @@ public class StripeDao extends PluginPaymentDao<StripeResponsesRecord, StripeRes
                                     additionalProperties.remove(StripeDao.REPLACE_ALL);
                                 }
                                 // Add the response field data
-                                @SuppressWarnings("unchecked")
                                 Map<String, Object> responseData = (Map<String, Object>) fromAdditionalData(response.getAdditionalData());
                                 originalData.putAll(responseData);
                              }
@@ -339,8 +339,9 @@ public class StripeDao extends PluginPaymentDao<StripeResponsesRecord, StripeRes
     }
 
     public void updateResponse(final StripeResponsesRecord stripeResponsesRecord,
-                               final Map additionalMetadata) throws SQLException {
-        final Map additionalDataMap = fromAdditionalData(stripeResponsesRecord.getAdditionalData());
+                               final Map<String, ? extends Object> additionalMetadata) throws SQLException {
+
+        final Map<String, Object> additionalDataMap = (Map<String, Object>) fromAdditionalData(stripeResponsesRecord.getAdditionalData());
         additionalDataMap.putAll(additionalMetadata);
 
         execute(dataSource.getConnection(),
@@ -366,7 +367,10 @@ public class StripeDao extends PluginPaymentDao<StripeResponsesRecord, StripeRes
             DSLContext dsl = DSL.using(conn, dialect, settings);
             
             if (stripeResponsesRecord != null) {
-                Map<String, Object> currentData = new HashMap<>(fromAdditionalData(stripeResponsesRecord.getAdditionalData()));
+                final Map<String, Object> rawData = (Map<String, Object>) fromAdditionalData(stripeResponsesRecord.getAdditionalData());
+                final Map<String, Object> currentData = (rawData == null)
+                    ? new HashMap<>()
+                    : new HashMap<>(rawData);
                 
                 // 2. Put your partial details
                 currentData.put("amount_received", amountReceived);
@@ -417,13 +421,13 @@ public class StripeDao extends PluginPaymentDao<StripeResponsesRecord, StripeRes
         });
     }
 
-    public static Map fromAdditionalData(@Nullable final String additionalData) {
+    public static Map<String, Object> fromAdditionalData(@Nullable final String additionalData) {
         if (additionalData == null) {
             return Collections.emptyMap();
         }
 
         try {
-            return objectMapper.readValue(additionalData, Map.class);
+            return objectMapper.readValue(additionalData, new TypeReference<Map<String, Object>>() {});
         } catch (final IOException e) {
             throw new RuntimeException(e);
         }
