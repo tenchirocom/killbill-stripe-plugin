@@ -63,6 +63,7 @@ public class StripeConfigProperties {
     
     // Stripe webhook signature verification
     private static final String PROPERTY_WEBHOOK_SECRET = PROPERTY_PREFIX + "webhookSecret";
+    private static final String PROPERTY_PUSH_NOTIFICATION_CB = PROPERTY_PREFIX + "pushNotificationCb";
 
     private static final SSLSocketFactory DEFAULT_SSL_SOCKET_FACTORY = HttpsURLConnection.getDefaultSSLSocketFactory();
     private static final HostnameVerifier DEFAULT_HOSTNAME_VERIFIER = HttpsURLConnection.getDefaultHostnameVerifier();
@@ -96,6 +97,7 @@ public class StripeConfigProperties {
     private final boolean cancelOn3DSAuthorizationFailure;
     // Stripe signature verification
     private final String webhookSecret;
+    private final String pushNotificationCb;
 
     public StripeConfigProperties(final Properties properties, final String region) {
         this.region = region;
@@ -114,10 +116,16 @@ public class StripeConfigProperties {
         this.cancelOn3DSAuthorizationFailure = readCancelOn3DSAuthorizationFailure(properties);
         // Stripe webhook signature verification
         this.webhookSecret = StripeConfigPropertyResolver.resolve(properties.getProperty(PROPERTY_WEBHOOK_SECRET));
+        // Killbill push notification callback url
+        this.pushNotificationCb = StripeConfigPropertyResolver.resolve(properties.getProperty(PROPERTY_PUSH_NOTIFICATION_CB));
     }
 
     public String getWebhookSecret() {
         return webhookSecret;
+    }
+
+    public String getPushNotificationCb() {
+        return pushNotificationCb;
     }
 
     public String getApiKey() {

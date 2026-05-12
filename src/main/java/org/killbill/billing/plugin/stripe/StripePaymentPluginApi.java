@@ -27,8 +27,14 @@
 package org.killbill.billing.plugin.stripe;
 
 import java.math.BigDecimal;
+import java.net.URI;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.net.http.HttpClient;
 import java.sql.SQLException;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -41,6 +47,10 @@ import java.util.stream.StreamSupport;
 import java.util.function.Supplier;
 
 import javax.annotation.Nullable;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import org.joda.time.DateTime;
 import org.killbill.billing.ObjectType;
@@ -74,6 +84,8 @@ import org.killbill.billing.plugin.stripe.dao.gen.tables.records.StripeHppReques
 import org.killbill.billing.plugin.stripe.dao.gen.tables.records.StripePaymentMethodsRecord;
 import org.killbill.billing.plugin.stripe.dao.gen.tables.records.StripeResponsesRecord;
 import org.killbill.billing.plugin.util.KillBillMoney;
+import org.killbill.billing.tenant.api.TenantApiException;
+import org.killbill.billing.tenant.api.TenantUserApi;
 import org.killbill.billing.util.api.CustomFieldApiException;
 import org.killbill.billing.util.callcontext.CallContext;
 import org.killbill.billing.util.callcontext.TenantContext;
@@ -1682,7 +1694,6 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
         // read the PROCESSED status we just wrote, and close the invoice.
         // Without this, KillBill waits for the Janitor polling cycle (up to hours).
         try {
-            final UUID kbAccountId = UUID.fromString(record.getKbAccountId());
             final UUID kbPaymentId = UUID.fromString(record.getKbPaymentId());
 
             // withPluginInfo=true forces KillBill to call getPaymentInfo() on this plugin,
@@ -1705,6 +1716,144 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             // State transition failed — same reasoning as above.
             logger.warn("Webhook: could not notify KillBill of state change for PI {}",
                         intent.getId(), e);
+        }
+    }
+
+    /**
+     * Use this client for http connections to the application notification
+     * callback url.
+     * 
+     * NOTE: Use static variable to conserve resources.
+     */
+    private static final HttpClient notificationHttpClient = HttpClient.newHttpClient();
+
+    private void notifyActionRequired(
+            final PaymentIntent intent,
+            final String singleUseType,
+            final StripeResponsesRecord record,
+            final CallContext context
+    ) {
+        //
+        // GET PUSH_NOTIFICATION_CB URL
+        //
+
+        // Check plugin properties for custom push notification callback url
+        final StripeConfigProperties stripeConfigProperties =
+            stripeConfigPropertiesConfigurationHandler.getConfigurable(context.getTenantId());
+        String pushNotificationCb = stripeConfigProperties.getPushNotificationCb();
+
+        // Bound check: callback url in properties
+        if (pushNotificationCb == null || pushNotificationCb.isBlank()) {
+            // Get notification callback from Kill Bill
+            pushNotificationCb = getPushNotificationCb(context);
+            // Bound check: callback url configured in killbill
+            if (pushNotificationCb == null || pushNotificationCb.isBlank()) {
+                // Warn: no callback notification. Kill Bill apps will not be notified of special events
+                logger.warn("Stripe Plugin: No push notification configured. Unable to notify application of change.");
+                return;
+            }
+        }
+
+        //
+        // CONSTRUCT NOTIFICATION PAYLOAD
+        //
+
+        // Extract the action details you already computed in extractNextActionDetails()
+        final Map<String, Object> actionDetails = 
+            StripeVirtualPaymentMethods.extractNextActionDetails(intent, singleUseType);
+        if (actionDetails.isEmpty()) return;
+
+        // Build a payload that mimics the shape of a KillBill push notification
+        // so your Django webhook handler needs minimal changes
+        final Map<String, Object> payload = new HashMap<>();
+        payload.put("eventType",   "PAYMENT_ACTION_REQUIRED");
+        payload.put("accountId",   record.getKbAccountId());
+        payload.put("objectType",  "PAYMENT");
+        payload.put("objectId",    record.getKbPaymentId());
+        payload.put("metaData",    asJson(Map.of(
+            "paymentTransactionId", record.getKbPaymentTransactionId(),
+            "actionType",           singleUseType.toUpperCase(),
+            "actionDetails",        actionDetails,
+            "stripeIntentId",       intent.getId()
+        )));
+
+        //
+        // SECURITY: Sign the payload
+        //
+        String signKey = stripeConfigProperties.getApiKey();
+        String jsonBody = asJson(payload);
+        // Initialize signature as unsigned by default
+        String signature = "unsigned";
+        if (jsonBody != null && !jsonBody.isBlank() && signKey != null && !signKey.isBlank()) {
+            // If we have a key and a body, then sign the json payload.
+            signature = signPayload(jsonBody, signKey);
+        }
+
+        try {
+            final HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(pushNotificationCb))
+                .header("Content-Type", "application/json")
+                .header("X-Killbill-Stripe-Signature", signature)
+                .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
+                .timeout(Duration.ofSeconds(5))
+                .build();
+
+            final String cbUrl = pushNotificationCb;
+            notificationHttpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+                .thenAccept(response -> {
+                    if (response.statusCode() >= 400) {
+                        logger.warn("Stripe Plugin: Notification rejected by {}, status={}", cbUrl, response.statusCode());
+                    } else {
+                        logger.info("Stripe Plugin: Action-required notification sent, status={}", response.statusCode());
+                    }
+                });
+
+        } catch (final Exception e) {
+            // Non-fatal — the Janitor and Stripe webhooks are the fallback
+            logger.warn("Stripe Plugin: Failed to send action-required notification for PI {}", intent.getId(), e);
+        }
+    }
+
+    public String getPushNotificationCb(TenantContext context) {
+        try {
+            // Access the TenantUserApi through the global OSGIKillbillAPI
+            TenantUserApi tenantApi = killbillAPI.getTenantUserApi();
+            
+            // Retrieve the specific system key for push notifications
+            List<String> values = tenantApi.getTenantValuesForKey("PUSH_NOTIFICATION_CB", context);
+            
+            if (values != null && !values.isEmpty()) {
+                return values.get(0); // This is your registered webhook URL
+            }
+        } catch (TenantApiException e) {
+            logger.error("Stripe Plugin: Failed to retrieve webhook URL for tenant {}", context.getTenantId(), e);
+        }
+        return null;
+    }
+
+    // 1. Define the mapper (usually at the top of your class)
+    private static final ObjectMapper mapper = new ObjectMapper();
+
+    // 2. Define the helper method
+    private String asJson(Object obj) {
+        try {
+            return mapper.writeValueAsString(obj);
+        } catch (Exception e) {
+            // Log the error so you know if your payload is malformed
+            logger.error("Stripe Plugin: Failed to serialize to JSON", e);
+            return "{}"; 
+        }
+    }
+
+    private String signPayload(String payload, String secret) {
+        try {
+            Mac sha256_HMAC = Mac.getInstance("HmacSHA256");
+            SecretKeySpec secret_key = new SecretKeySpec(secret.getBytes("UTF-8"), "HmacSHA256");
+            sha256_HMAC.init(secret_key);
+            return Base64.getEncoder().encodeToString(sha256_HMAC.doFinal(payload.getBytes("UTF-8")));
+        } catch (Exception e) {
+            logger.error("Stripe Plugin: Signing failed", e);
+            return "";
         }
     }
 
