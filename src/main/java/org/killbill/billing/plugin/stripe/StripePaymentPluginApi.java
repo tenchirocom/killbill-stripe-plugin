@@ -1591,10 +1591,17 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
 
                             logger.info("<plough> CHECKPOINT-3 ... lastCharge={}", lastCharge);
 
-                            // Update DB
+                            // Update DB, Full replacement to remove any vestigual fields
+                            //
+                            // NOTE: the option flag REPLACE_ALL causes the updateReponse to be have as a replace response wrt the
+                            // additional data. This is necessary here to prevent stale fields. Different events use different
+                            // field values. When the payment intent evolves, the unused fields must be pruned.
+
                             final UUID kbTransactionId = UUID.fromString(record.getKbPaymentTransactionId());
                             // Updates the response with the intent data
-                            StripeResponsesRecord updatedRecord = dao.updateResponse(kbTransactionId, intent, lastCharge, kbTenantId);
+                            final Map<String, Object> additionalDataMap = StripePluginProperties.toAdditionalDataMap(intent, lastCharge);
+                            additionalDataMap.put(StripeDao.REPLACE_ALL, true);
+                            StripeResponsesRecord updatedRecord = dao.updateResponse(kbTransactionId, additionalDataMap, kbTenantId);
 
                             logger.info("<plough> CHECKPOINT-4 ... updateRecord={}", updatedRecord);
 
@@ -1621,12 +1628,15 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                                 Long amountReceived = intent.getAmount() - amountRemaining;
                                 
                                 logger.info("<plough> CHECKPOINT-7 amount_received={}, amount_remaining={}", amountReceived, amountRemaining);
+
+                                //
+                                // Add the additional partial payment data to the response
+                                //
                                 
                                 final Map<String, Object> partialData = new HashMap<>();
                                 partialData.put("amount_funded", amountReceived);
-                                //partialData.put("amount_remaining", amountRemaining);
+                                partialData.put("amount_remaining", amountRemaining);
                                 partialData.put("partial_funding_event_id", event.getId());
-                                
                                 dao.updateResponse(kbTransactionId, partialData, kbTenantId);
                                 
                                 logger.info("Webhook: partial bank transfer received for PI {} — "

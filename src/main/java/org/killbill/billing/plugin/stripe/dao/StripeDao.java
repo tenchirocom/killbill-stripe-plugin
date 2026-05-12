@@ -19,12 +19,14 @@ package org.killbill.billing.plugin.stripe.dao;
 
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -61,6 +63,10 @@ import static org.killbill.billing.plugin.stripe.dao.gen.tables.StripePaymentMet
 import static org.killbill.billing.plugin.stripe.dao.gen.tables.StripeResponses.STRIPE_RESPONSES;
 
 public class StripeDao extends PluginPaymentDao<StripeResponsesRecord, StripeResponses, StripePaymentMethodsRecord, StripePaymentMethods> {
+
+    private static final Set<String> ZERO_DECIMAL_CURRENCIES = Set.of("JPY", "KRW", "VND", "IDR", "CLP");
+
+    public static String REPLACE_ALL = "_dao_flag_replace";
 
     public StripeDao(final DataSource dataSource) throws SQLException {
         super(STRIPE_RESPONSES, STRIPE_PAYMENT_METHODS, dataSource);
@@ -259,19 +265,41 @@ public class StripeDao extends PluginPaymentDao<StripeResponsesRecord, StripeRes
                     new WithConnectionCallback<StripeResponsesRecord>() {
                         @Override
                         public StripeResponsesRecord withConnection(final Connection conn) throws SQLException {
+
+                            if (additionalProperties == null) {
+                                return null;
+                            }
+
                             final StripeResponsesRecord response = DSL.using(conn, dialect, settings)
-                                                                        .selectFrom(STRIPE_RESPONSES)
-                                                                        .where(STRIPE_RESPONSES.KB_PAYMENT_TRANSACTION_ID.equal(kbPaymentTransactionId.toString()))
-                                                                        .and(STRIPE_RESPONSES.KB_TENANT_ID.equal(kbTenantId.toString()))
-                                                                        .orderBy(STRIPE_RESPONSES.RECORD_ID.desc())
-                                                                        .limit(1)
-                                                                        .fetchOne();
+                                            .selectFrom(STRIPE_RESPONSES)
+                                            .where(STRIPE_RESPONSES.KB_PAYMENT_TRANSACTION_ID.equal(kbPaymentTransactionId.toString()))
+                                            .and(STRIPE_RESPONSES.KB_TENANT_ID.equal(kbTenantId.toString()))
+                                            .orderBy(STRIPE_RESPONSES.RECORD_ID.desc())
+                                            .limit(1)
+                                            .fetchOne();
 
                             if (response == null) {
                                 return null;
                             }
 
-                            final Map originalData = new HashMap(fromAdditionalData(response.getAdditionalData()));
+                            final Map<String, Object> originalData = new HashMap<String, Object>();
+                            if (Boolean.TRUE.equals(additionalProperties.get(StripeDao.REPLACE_ALL))) {
+                                // If the replace flag is set then use and empty map, and remove the key.
+                                additionalProperties.remove(StripeDao.REPLACE_ALL);
+                            } else {
+                                // Guard: against missing key
+                                if (additionalProperties.containsKey(StripeDao.REPLACE_ALL)) {
+                                    // Remove the flag
+                                    additionalProperties.remove(StripeDao.REPLACE_ALL);
+                                }
+                                // Add the response field data
+                                @SuppressWarnings("unchecked")
+                                Map<String, Object> responseData = (Map<String, Object>) fromAdditionalData(response.getAdditionalData());
+                                originalData.putAll(responseData);
+                             }
+                            
+
+                            // Override updated values
                             originalData.putAll(additionalProperties);
 
                             // Extract amount/currency if present in the data
@@ -281,31 +309,12 @@ public class StripeDao extends PluginPaymentDao<StripeResponsesRecord, StripeRes
                             if (originalData.containsKey("last_charge_amount")) {
                                 Long minorUnits = ((Number) originalData.get("last_charge_amount")).longValue();
                                 currency = (String) originalData.get("last_charge_currency");
-
-                                // Zero-decimal currencies (no minor units)
-                                if ("JPY".equalsIgnoreCase(currency) ||
-                                    "KRW".equalsIgnoreCase(currency) ||
-                                    "VND".equalsIgnoreCase(currency) ||
-                                    "IDR".equalsIgnoreCase(currency) ||
-                                    "CLP".equalsIgnoreCase(currency)) {
-                                    amount = new BigDecimal(minorUnits);           // NO division
-                                } else {
-                                    amount = new BigDecimal(minorUnits).divide(BigDecimal.valueOf(100));
-                                }
+                                amount = formatValueForCurrency(minorUnits, currency);
                             } 
                             else if (originalData.containsKey("amount")) {
                                 Long minorUnits = ((Number) originalData.get("amount")).longValue();
                                 currency = (String) originalData.get("currency");
-
-                                if ("JPY".equalsIgnoreCase(currency) ||
-                                    "KRW".equalsIgnoreCase(currency) ||
-                                    "VND".equalsIgnoreCase(currency) ||
-                                    "IDR".equalsIgnoreCase(currency) ||
-                                    "CLP".equalsIgnoreCase(currency)) {
-                                    amount = new BigDecimal(minorUnits);
-                                } else {
-                                    amount = new BigDecimal(minorUnits).divide(BigDecimal.valueOf(100));
-                                }
+                                amount = formatValueForCurrency(minorUnits, currency);
                             }
 
                             DSL.using(conn, dialect, settings)
@@ -434,5 +443,23 @@ public class StripeDao extends PluginPaymentDao<StripeResponsesRecord, StripeRes
                                          .fetchOne();
                            }
                        });
+    }
+
+    /**
+     * Normalizes Stripe minor units (e.g., cents or yen) into a {@link BigDecimal} 
+     * representation based on the currency's decimal rules.
+     * * <p>Zero-decimal currencies like JPY are returned as-is, while decimal 
+     * currencies like USD are divided by 100.</p>
+     *
+     * @param value    The amount in minor units (from Stripe)
+     * @param currency The ISO currency code (e.g., "JPY", "USD")
+     * @return A BigDecimal representing the human-readable amount (e.g., 220 or 2.20)
+     */
+    private BigDecimal formatValueForCurrency(Long value, String currency) {
+        if (currency != null && ZERO_DECIMAL_CURRENCIES.contains(currency.toUpperCase())) {
+            return new BigDecimal(value);
+        } else {
+            return new BigDecimal(value).divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP);
+        }
     }
 }
