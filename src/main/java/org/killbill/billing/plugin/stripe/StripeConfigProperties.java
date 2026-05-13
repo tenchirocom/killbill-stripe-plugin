@@ -61,9 +61,12 @@ public class StripeConfigProperties {
 
     private static final String PROPERTY_PREFIX = "org.killbill.billing.plugin.stripe.";
     
-    // Stripe webhook signature verification
+    // Stripe webhook signature verification (Between plugin and stripe system)
     private static final String PROPERTY_WEBHOOK_SECRET = PROPERTY_PREFIX + "webhookSecret";
+    // Killbill push notification callback (Between Killbill/Plugin -> Application)
     private static final String PROPERTY_PUSH_NOTIFICATION_CB = PROPERTY_PREFIX + "pushNotificationCb";
+    // Killbill push notification secret (Between Killbill/Plugin -> Application)
+    private static final String PROPERTY_PUSH_NOTIFICATION_SECRET = PROPERTY_PREFIX + "pushNotificationSecret";
 
     private static final SSLSocketFactory DEFAULT_SSL_SOCKET_FACTORY = HttpsURLConnection.getDefaultSSLSocketFactory();
     private static final HostnameVerifier DEFAULT_HOSTNAME_VERIFIER = HttpsURLConnection.getDefaultHostnameVerifier();
@@ -98,6 +101,7 @@ public class StripeConfigProperties {
     // Stripe signature verification
     private final String webhookSecret;
     private final String pushNotificationCb;
+    private final String pushNotificationSecret;
 
     public StripeConfigProperties(final Properties properties, final String region) {
         this.region = region;
@@ -114,10 +118,12 @@ public class StripeConfigProperties {
         this.chargeDescription = Ascii.truncate(MoreObjects.firstNonNull(properties.getProperty(PROPERTY_PREFIX + "chargeDescription"), "Kill Bill charge"), 22, "...");
         this.chargeStatementDescriptor = Ascii.truncate(MoreObjects.firstNonNull(properties.getProperty(PROPERTY_PREFIX + "chargeStatementDescriptor"), "Kill Bill charge"), 22, "...");
         this.cancelOn3DSAuthorizationFailure = readCancelOn3DSAuthorizationFailure(properties);
-        // Stripe webhook signature verification
+        // Stripe webhook signature verification (Stripe system -> Killbill/plugin)
         this.webhookSecret = StripeConfigPropertyResolver.resolve(properties.getProperty(PROPERTY_WEBHOOK_SECRET));
-        // Killbill push notification callback url
+        // Killbill push notification callback url (Killbill/plugin -> application)
         this.pushNotificationCb = StripeConfigPropertyResolver.resolve(properties.getProperty(PROPERTY_PUSH_NOTIFICATION_CB));
+        // Killbill push notification secret (Killbill/plugin -> application)
+        this.pushNotificationSecret = StripeConfigPropertyResolver.resolve(properties.getProperty(PROPERTY_PUSH_NOTIFICATION_SECRET));
     }
 
     public String getWebhookSecret() {
@@ -126,6 +132,10 @@ public class StripeConfigProperties {
 
     public String getPushNotificationCb() {
         return pushNotificationCb;
+    }
+
+    public String getPushNotificationSecret() {
+        return pushNotificationSecret;
     }
 
     public String getApiKey() {

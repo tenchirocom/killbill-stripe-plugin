@@ -84,6 +84,7 @@ import org.killbill.billing.plugin.stripe.dao.gen.tables.records.StripeHppReques
 import org.killbill.billing.plugin.stripe.dao.gen.tables.records.StripePaymentMethodsRecord;
 import org.killbill.billing.plugin.stripe.dao.gen.tables.records.StripeResponsesRecord;
 import org.killbill.billing.plugin.util.KillBillMoney;
+import org.killbill.billing.tenant.api.Tenant;
 import org.killbill.billing.tenant.api.TenantApiException;
 import org.killbill.billing.tenant.api.TenantUserApi;
 import org.killbill.billing.util.api.CustomFieldApiException;
@@ -1477,7 +1478,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             return "stripe-notification-exception-event-" + System.currentTimeMillis();
         };
 
-        logger.info("Received Stripe webhook");
+        logger.info("Received Stripe webhook <plough>");
 
         // Bound check: A notification event is supplied
         if (notification == null || notification.isBlank()) {
@@ -1665,6 +1666,26 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                                 logger.info("Stripe Webhook: <plough> updated response for PI {} → {}",
                                         intentId, intent.getStatus());
                             }
+
+                            // SEND NOTIFICATION EVENT
+                            List<String> paymentMethodTypes = intent.getPaymentMethodTypes();
+
+                            // Check if list is not null and has at least one element
+                            String stripeType = (paymentMethodTypes != null && !paymentMethodTypes.isEmpty()) 
+                                                ? paymentMethodTypes.get(0) 
+                                                : null;
+                            if ("konbini".equals(stripeType)) {
+                                notifyActionRequired(intent, "konbini", updatedRecord, context);
+                            } else if ("customer_balance".equals(stripeType)) {
+                                // Note: ensure 'virtualType' is defined in your current scope
+                                notifyActionRequired(intent, "bank_transfer", updatedRecord, context);
+                            } else {
+                                logger.info(
+                                    "Stripe Webhook: virtual type not recognized for user='{}', stripeType='{}', no notification message",
+                                    updatedRecord.getKbAccountId(),
+                                    stripeType
+                                );
+                            }
                         }
                     } catch (final SQLException e) {
                         logger.error("Webhook: DB error updating response for PI {}", intentId, e);
@@ -1729,7 +1750,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
 
     private void notifyActionRequired(
             final PaymentIntent intent,
-            final String singleUseType,
+            final String virtualType,
             final StripeResponsesRecord record,
             final CallContext context
     ) {
@@ -1760,7 +1781,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
 
         // Extract the action details you already computed in extractNextActionDetails()
         final Map<String, Object> actionDetails = 
-            StripeVirtualPaymentMethods.extractNextActionDetails(intent, singleUseType);
+            StripeVirtualPaymentMethods.extractNextActionDetails(intent, virtualType);
         if (actionDetails.isEmpty()) return;
 
         // Build a payload that mimics the shape of a KillBill push notification
@@ -1772,7 +1793,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
         payload.put("objectId",    record.getKbPaymentId());
         payload.put("metaData",    asJson(Map.of(
             "paymentTransactionId", record.getKbPaymentTransactionId(),
-            "actionType",           singleUseType.toUpperCase(),
+            "actionType",           virtualType.toUpperCase(),
             "actionDetails",        actionDetails,
             "stripeIntentId",       intent.getId()
         )));
@@ -1780,20 +1801,20 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
         //
         // SECURITY: Sign the payload
         //
-        String signKey = stripeConfigProperties.getApiKey();
+        final String signKey = stripeConfigProperties.getPushNotificationSecret();
         String jsonBody = asJson(payload);
         // Initialize signature as unsigned by default
         String signature = "unsigned";
         if (jsonBody != null && !jsonBody.isBlank() && signKey != null && !signKey.isBlank()) {
             // If we have a key and a body, then sign the json payload.
-            signature = signPayload(jsonBody, signKey);
+            signature = signPayload(jsonBody, signKey.trim());
         }
 
         try {
             final HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(pushNotificationCb))
                 .header("Content-Type", "application/json")
-                .header("X-Killbill-Stripe-Signature", signature)
+                .header("X-Killbill-Payload-Signature", signature)
                 .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
                 .timeout(Duration.ofSeconds(5))
                 .build();
@@ -1931,13 +1952,16 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                         paymentIntentParams.put("currency",          currency.toString());
                         paymentIntentParams.put("capture_method",    captureMethod.value);
                         paymentIntentParams.put("description",       stripeConfigProperties.getChargeDescription());
-                        paymentIntentParams.put("statement_descriptor_suffix", stripeConfigProperties.getChargeStatementDescriptor());
+                        paymentIntentParams.put("statement_descriptor", stripeConfigProperties.getChargeStatementDescriptor());
                         // Populate the metadata
                         ImmutableMap.Builder<String, String> metadataBuilder = ImmutableMap.<String, String>builder()
+                            // Add basic Kill Bill data to metadata
                             .put("kbAccountId", kbAccountId.toString())
                             .put("kbPaymentId", kbPaymentId.toString())
                             .put("kbTransactionId", kbTransactionId.toString())
-                            .put("kbPaymentMethodId", kbPaymentMethodId.toString());
+                            .put("kbPaymentMethodId", kbPaymentMethodId.toString())
+                            // Add the virtual type to metadata
+                            .put("type", virtualType);
                         if (!Strings.isNullOrEmpty(kbInvoiceId.toString())) {
                             // Only include if it is available
                             metadataBuilder.put("kbInvoiceId", kbInvoiceId.toString());
