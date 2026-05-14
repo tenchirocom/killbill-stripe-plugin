@@ -35,7 +35,6 @@ import com.stripe.model.BankAccount;
 import com.stripe.model.Charge;
 import com.stripe.model.PaymentIntent;
 import com.stripe.model.PaymentMethod;
-import com.stripe.model.PaymentMethod.Card;
 import com.stripe.model.PaymentSource;
 import com.stripe.model.SetupIntent;
 import com.stripe.model.SetupIntent.PaymentMethodOptions;

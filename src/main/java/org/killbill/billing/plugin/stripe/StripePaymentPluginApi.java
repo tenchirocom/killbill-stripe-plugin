@@ -94,6 +94,7 @@ import org.killbill.billing.util.customfield.CustomField;
 import org.killbill.clock.Clock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.MoreObjects;
@@ -127,6 +128,7 @@ import com.stripe.param.ChargeSearchParams;
 import com.stripe.param.PaymentIntentCancelParams;
 import com.stripe.model.Event;
 import com.stripe.net.Webhook;
+
 
 public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeResponsesRecord, StripeResponses, StripePaymentMethodsRecord, StripePaymentMethods> {
 
@@ -1478,23 +1480,26 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             return "stripe-notification-exception-event-" + System.currentTimeMillis();
         };
 
-        logger.info("Received Stripe webhook <plough>");
-
         // Bound check: A notification event is supplied
         if (notification == null || notification.isBlank()) {
-            logger.warn("Received empty webhook payload");
+            logger.warn("Stripe Notification: Received empty webhook payload");
             return new PluginGatewayNotification(exceptionEvent.get());
         }
 
-        // Extract the signature header from properties
-        final String sigHeader = properties != null 
-            ? PluginProperties.findPluginPropertyValue("Stripe-Signature", properties) 
-            : null;
+        logger.info("Stripe Notification: Notification string is: {}", notification);
 
-        // Extract tenant id from context
+        // Get signature from the parameters.
+        //
+        // NOTE: This is a hack. Stripe sends the signature via the message header, Stripe_Signature, which
+        // is more secure. However, the headers are not in the properties or context and therefore it
+        // is being pulled from the MDC, which it happens to be in, but this is far from ideal.
+        final String stripeSignatureHeader = MDC.get("req.queryString");
+        final String stripeSignature = extractQueryParam(stripeSignatureHeader, "stripe-signature");
+
+        // Get tenant id from context
         UUID kbTenantId = context.getTenantId();
 
-        // Get the secret for signature verification
+        // Get secret for signature verification
         final StripeConfigProperties config = stripeConfigPropertiesConfigurationHandler
                 .getConfigurable(kbTenantId);
         final String webhookSecret = config.getWebhookSecret();
@@ -1502,11 +1507,11 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
         // SECURITY WARNING: if no secret is configured → signature verification is turned OFF
         if (webhookSecret == null || webhookSecret.isBlank()) {
             logger.error("=================================================================");
-            logger.error("⚠️  CRITICAL: USING DEFAULT WEBHOOK SECRET (INSECURE!)");
+            logger.error("⚠️  CRITICAL: USING DEFAULT STRIPE WEBHOOK SECRET (INSECURE!)");
             logger.error("    The property 'org.killbill.billing.plugin.stripe.webhookSecret'");
             logger.error("    is not configured. Using fallback default secret.");
-            logger.error("    ADD THIS TO YOUR KILLBILL CONFIG IMMEDIATELY:");
-            logger.error("    org.killbill.billing.plugin.stripe.webhookSecret=whsec_xxxxxxxxxxxxxxxxxxxxxxxx");
+            logger.error("    ADD THIS TO YOUR KILLBILL CONFIG IMMEDIATELY TO ENABLE PROPERLY:");
+            logger.error("    org.killbill.billing.plugin.stripe.webhookSecret=whsec_<hexstring>");
             logger.error("=================================================================");
         }
 
@@ -1517,25 +1522,32 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             // SIGNATURE VERIFICATION & EVENT EXTRACTION
             //
             if (webhookSecret == null || webhookSecret.isBlank()) {
-                // Dev mode: skip signature verification completely
+                // Dev mode: when the webhookSecret is not configured, this disables the signature
+                // verification. skip signature verification completely
                 event = Event.GSON.fromJson(notification, Event.class);
-                logger.info("Parsed Stripe webhook WITHOUT signature verification, continuing (dev mode)...");
+                logger.info("Stripe Webhook, continuing WITHOUT signature verification (dev mode)...");
             } else {
                 // Production mode: enforce signature verification
-                if (sigHeader == null) {
+                if (stripeSignature == null) {
                     // NO SIGNATURE HEADER FOUND
-                    logger.warn("STRIPE WEBHOOK IGNORED: Webhook received without Stripe-Signature header.");
+                    logger.warn("Stripe Webhook: notification received without signature.");
+                    //
+                    // ABORT
+                    //
                     return new PluginGatewayNotification(exceptionEvent.get());
                 }
                 // This verifies the signature and parses the event If the signature doesn't match
                 // throws a SignatureVerificationException
-                event = Webhook.constructEvent(notification, sigHeader, webhookSecret);
-                logger.info("Verified Stripe webhook event: type={} id={}", event.getType(), event.getId());
+                event = Webhook.constructEvent(notification, stripeSignature, webhookSecret);
+                logger.info("Stripe Webhook: authenticated notice for tenant_id={}, event_type={}.", kbTenantId.toString(), event.getType());
             }
 
             // Bound check: notification contained no event
             if (event == null) {
-                logger.warn("Failed to parse Stripe event - no event object");
+                logger.warn("Stripe Webhook: unable to parse event object from notice.");
+                //
+                // Abort
+                //
                 return new PluginGatewayNotification(exceptionEvent.get());
             }
 
@@ -1568,7 +1580,10 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                         intent = PaymentIntent.GSON.fromJson(
                             deserializer.getRawJson(), PaymentIntent.class);
                     } catch (Exception parseEx) {
-                        logger.error("Webhook: failed to deserialize PaymentIntent from raw JSON", parseEx);
+                        logger.error("Stripe Webhook: failed to unpack payment intent from the notification.", parseEx);
+                        //
+                        // ABORT
+                        //
                         return new PluginGatewayNotification(event.getId());
                     }
                 }
@@ -1639,20 +1654,20 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                                 }
 
                                 Long amountReceived = intent.getAmount() - amountRemaining;
-                                
+
                                 logger.info("<plough> CHECKPOINT-7 amount_received={}, amount_remaining={}", amountReceived, amountRemaining);
 
                                 //
                                 // Add the additional partial payment data to the response
                                 //
-                                
+
                                 final Map<String, Object> partialData = new HashMap<>();
                                 partialData.put("amount_funded", amountReceived);
                                 partialData.put("amount_remaining", amountRemaining);
                                 partialData.put("partial_funding_event_id", event.getId());
                                 dao.updateResponse(kbTransactionId, partialData, kbTenantId);
                                 
-                                logger.info("Webhook: partial bank transfer received for PI {} — "
+                                logger.info("<plough> partial bank transfer received for PI {} — "
                                         + "received={} of {} {}. Payment remains PENDING.",
                                         intentId,
                                         amountReceived,
@@ -1663,7 +1678,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                                 
                                 // Succeeded, failed, or canceled — trigger full state reconciliation.
                                 notifyStateChange(updatedRecord, intent, properties, context);
-                                logger.info("Stripe Webhook: <plough> updated response for PI {} → {}",
+                                logger.info("<plough> updated response for PI {} → {}",
                                         intentId, intent.getStatus());
                             }
 
@@ -1681,22 +1696,22 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                                 notifyActionRequired(intent, "bank_transfer", updatedRecord, context);
                             } else {
                                 logger.info(
-                                    "Stripe Webhook: virtual type not recognized for user='{}', stripeType='{}', no notification message",
+                                    "<plough> virtual type not recognized for user='{}', stripeType='{}', no notification message",
                                     updatedRecord.getKbAccountId(),
                                     stripeType
                                 );
                             }
                         }
                     } catch (final SQLException e) {
-                        logger.error("Webhook: DB error updating response for PI {}", intentId, e);
+                        logger.error("Stripe Webhook: DB error updating response, tenant_id={} intent_id={}", kbTenantId.toString(), intentId);
                     }
                     return new PluginGatewayNotification(event.getId());
                 }
             }
         } catch (final SignatureVerificationException e) {
-            logger.warn("STRIPE WEBHOOK IGNORED: Invalid Stripe webhook signature", e);
+            logger.warn("Stripe Webhook: IGNORED Stripe notification with invalid signature: {}", e);
         } catch (final Exception e) {
-            logger.error("STRIPE WEBHOOK ERROR: Failed to process Stripe webhook", e);
+            logger.error("Stripe Webhook: Failed to process Stripe webhook: {}", e);
         }
 
         // Return a non-null notification for all cases so KillBill responds 200 to Stripe.
@@ -1876,6 +1891,25 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
             logger.error("Stripe Plugin: Signing failed", e);
             return "";
         }
+    }
+
+    private String extractQueryParam(String queryString, String paramName) {
+        if (queryString == null || queryString.isBlank()) return null;
+        
+        try {
+            for (String pair : queryString.split("&")) {
+                String[] kv = pair.split("=", 2);
+                if (kv.length == 2) {
+                    String key = java.net.URLDecoder.decode(kv[0].trim(), java.nio.charset.StandardCharsets.UTF_8);
+                    if (paramName.equalsIgnoreCase(key)) {
+                        return java.net.URLDecoder.decode(kv[1], java.nio.charset.StandardCharsets.UTF_8);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.warn("<plough> Failed to parse query string", e);
+        }
+        return null;
     }
 
     // -------------------------------------------------------------------------
