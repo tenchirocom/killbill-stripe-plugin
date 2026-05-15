@@ -26,21 +26,20 @@ import java.util.UUID;
 
 /**
  * GatewayPluginCallContext
- * <p>
+ * 
  * WORKAROUND CLASS for Kill Bill call context limitations
- * <p>
- * Kill Bill's standard {@code CallContext} (and {@code PluginCallContext}) does NOT
+ * 
+ * Kill Bill's standard CallContext (and PluginCallContext) does NOT
  * propagate HTTP headers or query parameters from the original request down to plugins
  * when the generic notification endpoint is used.
- * <p>
- * This subclass extends {@code PluginCallContext} to carry both:
- * <ul>
- *   <li>All HTTP headers (case-insensitive lookup)</li>
- *   <li>All query parameters (case-insensitive lookup)</li>
- * </ul>
- * <p>
- * Use this when you need access to {@code Stripe-Signature} (or any other header/query param)
- * inside {@code processNotification(...)} without relying on MDC or duplicating code.
+ * 
+ * This subclass extends PluginCallContext to carry both:
+ * 
+ *   - All HTTP headers (case-insensitive lookup)</li>
+ *   - All query parameters (case-insensitive lookup)</li>
+ * 
+ * Use this when you need access to Stripe-Signature (or any other header/query param)
+ * inside processNotification(...) without relying on MDC or duplicating code.
  */
 public class GatewayPluginCallContext extends PluginCallContext {
 
