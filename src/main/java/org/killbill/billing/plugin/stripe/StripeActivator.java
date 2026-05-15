@@ -77,9 +77,13 @@ public class StripeActivator extends KillbillActivatorBase {
                                                          super.clock,
                                                          configProperties).withRouteClass(StripeHealthcheckServlet.class)
                                                                           .withRouteClass(StripeCheckoutServlet.class)
+                                                                          .withRouteClass(StripeWebhookServlet.class)
                                                                           .withService(stripeHealthcheck)
                                                                           .withService(pluginApi)
                                                                           .withService(clock)
+                                                                          .withService(stripeConfigPropertiesConfigurationHandler)
+                                                                          .withService(stripeDao)
+                                                                          .withService(context)
                                                                           .build();
         final HttpServlet stripeServlet = PluginApp.createServlet(pluginApp);
         registerServlet(context, stripeServlet);

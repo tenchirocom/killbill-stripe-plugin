@@ -2067,14 +2067,14 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                             paymentIntentParams.put("payment_method_types", pmTypesBuilder.build());
                         }
 
-                        // The idempotency key uses the killbill invoice id (or payment id, if not present) and this prevents
-                        // creating a new intent for the same invoice (or payment) within a 24hour window.
-                        // NOTE: If the invoice is not available, the default payment id scheme ONLY prevents duplicate payments
-                        // by the payment itself. This is actually not sufficient for important scenaries. If a payment is in
+                        // The idempotency key uses the killbill transaction id (or payment id, if not present) and this prevents
+                        // creating a new intent for the same transaction (or payment) within a 24hour window.
+                        // NOTE: This is actually not sufficient for important scenaries. If a payment is in
                         // pending, and is reprocessed, kill bill initiates an entirely new payment, and thus a duplicate
-                        // will go through.
+                        // will go through. However, this is handle in the long-term deduplication in the purchasePayment()
+                        // method that checks the invoice for outstanding transactions with pending or success status.
 
-                        String idempotencyKey = "kb_inv_" + (!Strings.isNullOrEmpty(kbInvoiceId.toString())?kbInvoiceId.toString():kbPaymentId.toString());
+                        String idempotencyKey = "kb_inv_" + (!Strings.isNullOrEmpty(kbTransactionId.toString())?kbTransactionId.toString():kbPaymentId.toString());
                         RequestOptions requestOptionsWithIdempotency = RequestOptions.builder()
                             .setApiKey(requestOptions.getApiKey())
                             .setIdempotencyKey(idempotencyKey)
