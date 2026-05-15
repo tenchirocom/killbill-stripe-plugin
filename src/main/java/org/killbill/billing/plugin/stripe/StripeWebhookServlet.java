@@ -52,6 +52,11 @@ import com.stripe.model.Event;
 import com.stripe.model.PaymentIntent;
 import com.stripe.net.Webhook;
 
+/**
+ * Servlet responsible for handling Stripe webhook notifications.
+ * It maps to the path /plugins/killbill-stripe/webhook and manages
+ * authentication, DB updates, and state reconciliation with Kill Bill.
+ */
 @Singleton
 // Handle /plugins/killbill-stripe/webhook
 @Path("/webhook")
@@ -81,6 +86,10 @@ public class StripeWebhookServlet {
         this.stripeDao = stripeDao;
     }
 
+    /**
+     * Primary entry point for Jooby to handle the POST request from Stripe.
+     * Extracts headers and body, then delegates to the internal processNotification logic.
+     */
     @POST
     public Result handleWebhook(
         final Request request,
@@ -135,6 +144,14 @@ public class StripeWebhookServlet {
         }
     }
 
+    /**
+     * Core logic for processing the validated notification string.
+     * Decodes the Stripe Event, fetches the associated local record, and 
+     * updates the database based on the event type (Succeeded, Failed, Canceled, etc.).
+     * 
+     * Implements the standard processNotification() interface. Could be called directly from
+     * the plugin processNotification() override.
+     */
     public GatewayNotification processNotification(final String notification,
                                                 final Iterable<PluginProperty> properties,
                                                 final CallContext context) throws PaymentPluginApiException {
@@ -344,6 +361,10 @@ public class StripeWebhookServlet {
         );
     }
 
+    /**
+     * Validates the Stripe-Signature header using the configured Webhook Secret.
+     * Returns a verified Event object or null if authentication fails.
+     */
     private final Event getAuthenticatedEvent(String body, String secret, CallContext context) {
         // Bound check: secret provided
         if (secret == null || secret.isBlank()) {
@@ -405,6 +426,11 @@ public class StripeWebhookServlet {
         return null;
     }
 
+    /**
+     * Forces Kill Bill to refresh its payment state machine immediately.
+     * Calls the Kill Bill Payment API with 'withPluginInfo=true' to trigger 
+     * a call back into the plugin's getPaymentInfo() method.
+     */
     public void notifyStateChange(StripeResponsesRecord record, PaymentIntent intent, Iterable<PluginProperty> properties, CallContext context) {
         // Immediately notify KillBill to transition the payment state.
         // This triggers KillBill to call getPaymentInfo() on this plugin right now,
@@ -439,6 +465,10 @@ public class StripeWebhookServlet {
     /**
      * Use this client for http connections to the application notification
      * callback url.
+     * 
+     * Handles specific asynchronous payment methods (like Konbini or Bank Transfers).
+     * Sends a signed notification to an external application callback URL 
+     * when a user action is required to complete a payment.
      * 
      * NOTE: Share the class static connection to conserve resources.
      */
@@ -484,6 +514,10 @@ public class StripeWebhookServlet {
         }
     }
 
+    /**
+     * Constructs the JSON payload for external application notifications.
+     * Mimics the standard Kill Bill push notification structure.
+     */
     private Map<String, Object> buildNotificationBody(
         final PaymentIntent intent,
         final String virtualType,
@@ -509,6 +543,9 @@ public class StripeWebhookServlet {
         return payload;
     }
 
+    /**
+     * Retrieves the configured PUSH_NOTIFICATION_CB URL from Kill Bill tenant settings.
+     */
     private String getPushNotificationCb(TenantContext context) {
         try {
             // Access the TenantUserApi through the global OSGIKillbillAPI
@@ -526,17 +563,10 @@ public class StripeWebhookServlet {
         return null;
     }
 
-    // 2. Define the helper method
-    private String asJson(Object obj) {
-        try {
-            return mapper.writeValueAsString(obj);
-        } catch (Exception e) {
-            // Log the error so you know if your payload is malformed
-            logger.error("Stripe Plugin: Failed to serialize to JSON", e);
-            return "{}"; 
-        }
-    }
-
+    /**
+     * Generates an HmacSHA256 signature for the notification payload 
+     * to allow the receiving application to verify the request's authenticity.
+     */
     private String signPayload(String payload, String secret) {
         // Bound check: valid parameters
         if (payload == null || payload.isBlank() || secret == null || secret.isBlank()) {
@@ -555,6 +585,10 @@ public class StripeWebhookServlet {
         }
     }
 
+    /**
+     * Sends the signed JSON payload to the application callback URL asynchronously
+     * using the Java HttpClient.
+     */
     private void asyncSendSignedPayload(String url, String payload, String signature) {
         // Build the request
         final HttpRequest request = HttpRequest.newBuilder()
@@ -576,6 +610,9 @@ public class StripeWebhookServlet {
             });
     }
 
+    /**
+     * Utility method to parse a specific parameter value from a URL query string.
+     */
     private String extractQueryParam(String queryString, String paramName) {
         if (queryString == null || queryString.isBlank()) return null;
         
@@ -595,4 +632,16 @@ public class StripeWebhookServlet {
         return null;
     }
 
+    /**
+     * Helper to serialize Java objects into JSON strings using Jackson.
+     */
+    private String asJson(Object obj) {
+        try {
+            return mapper.writeValueAsString(obj);
+        } catch (Exception e) {
+            // Log the error so you know if your payload is malformed
+            logger.error("Stripe Plugin: Failed to serialize to JSON", e);
+            return "{}"; 
+        }
+    }
 }
