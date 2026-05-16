@@ -655,6 +655,7 @@ public final class StripeVirtualPaymentMethods {
                 nextAction.getKonbiniDisplayDetails();
 
             if (konbini != null) {
+                logger.info("<servlet> konbini next action={}", konbini);
                 // Try different possible getter names (library version differences)
                 details.put("konbini_confirmation_number", 
                     getFieldSafely(konbini, "confirmationNumber", "confirmation_number"));

@@ -184,7 +184,7 @@ public class StripeWebhookServlet {
         }
 
         // Get tenant id from context
-        UUID kbTenantId = context.getTenantId();
+        final UUID kbTenantId = context.getTenantId();
 
         // Get webhookSecret (required for authentication)
         // NOTE: Signature verification is turned off if this configuration is not set
@@ -193,17 +193,17 @@ public class StripeWebhookServlet {
         final String webhookSecret = config.getWebhookSecret();
 
         // Get authenticated event from notification
-        Event event = getAuthenticatedEvent(notification, webhookSecret, context);
+        final Event event = getAuthenticatedEvent(notification, webhookSecret, context);
         if (event == null) {
             logger.error("Stripe Webhook: authentication failed.");
             return new PluginGatewayNotification(exceptionEvent.get());
         }
 
-        logger.info("AUTHENTICATED!");
+        logger.info("<servlet> AUTHENTICATED!");
 
         try {
             //
-            // PROCESS PAYMENT UPDATES
+            // PROCESS PAYMENT INTENT UPDATES
             //
             final String eventType = event.getType();
             final boolean isPartialFunding = "payment_intent.partially_funded".equals(eventType);
@@ -211,6 +211,7 @@ public class StripeWebhookServlet {
             if ("payment_intent.succeeded".equals(eventType)
                 || "payment_intent.payment_failed".equals(eventType)
                 || "payment_intent.canceled".equals(eventType)
+                || "payment_intent.requires_action".equals(eventType)
                 || isPartialFunding
 
             ) {
@@ -287,13 +288,19 @@ public class StripeWebhookServlet {
 
                             logger.info("<servlet> CHECKPOINT-4 ... updateRecord={}", updatedRecord);
 
-                            // PARTIAL FUNDING
+                            // SPECIAL PROCESSING BY EVENT TYPE
                             //
                             // Partial funding is a special case that particularly affects Japan bank transfers.
                             // Some funds have arrived, but the full amount has not been received yet. The PaymentIntent
                             // remains in requires_action state. The DB record is upated with the partial amount for
                             // the user experience, but we do NOT trigger notifyStateChange — the invoice remains unpaid
                             // and open until full funding arrives.
+                            //
+                            // For successful endstate, we need to notify Killbill of a state change so it can
+                            // update the internal records. I.e. activate the Janitor.
+                            //
+                            // If this is action required event, then we are completed and ready to send push notification
+                            // to the application.
 
                             if (isPartialFunding) {
                                 // PARTIAL FUNDING SCENARIO
@@ -327,7 +334,7 @@ public class StripeWebhookServlet {
                                         amountReceived,
                                         intent.getAmount(),
                                         intent.getCurrency().toUpperCase());
-                            } else {
+                            } else if (!"payment_intent.requires_action".equals(eventType)) {
                                 // FULL FUNDING SCENARIO
                                 
                                 // Succeeded, failed, or canceled — trigger full state reconciliation.
@@ -336,25 +343,15 @@ public class StripeWebhookServlet {
                                         intentId, intent.getStatus());
                             }
 
-                            // SEND NOTIFICATION EVENT TO APPLICATION CALLBACK
+                            //
+                            // SEND PUSH NOTIFICATION EVENT TO APPLICATION CALLBACK
+                            //
                             List<String> paymentMethodTypes = intent.getPaymentMethodTypes();
-
                             // Check if list is not null and has at least one element
-                            String stripeType = (paymentMethodTypes != null && !paymentMethodTypes.isEmpty()) 
-                                                ? paymentMethodTypes.get(0) 
+                            final String stripeType = (paymentMethodTypes != null && !paymentMethodTypes.isEmpty()) 
+                                                ? ("customer_balance".equals(paymentMethodTypes.get(0))?"bank_transfer":paymentMethodTypes.get(0))
                                                 : null;
-                            if ("konbini".equals(stripeType)) {
-                                notifyActionRequired(intent, "konbini", updatedRecord, context);
-                            } else if ("customer_balance".equals(stripeType)) {
-                                // Note: ensure 'virtualType' is defined in your current scope
-                                notifyActionRequired(intent, "bank_transfer", updatedRecord, context);
-                            } else {
-                                logger.info(
-                                    "<servlet> virtual type not recognized for user='{}', stripeType='{}', no notification message",
-                                    updatedRecord.getKbAccountId(),
-                                    stripeType
-                                );
-                            }
+                            notifyActionRequired(eventType, intent, stripeType, updatedRecord, context);
                         }
                     } catch (final SQLException e) {
                         logger.error("Stripe Webhook: DB error updating response, tenant_id={} intent_id={}", kbTenantId.toString(), intentId);
@@ -488,6 +485,7 @@ public class StripeWebhookServlet {
      * NOTE: Share the class static connection to conserve resources.
      */
     public void notifyActionRequired(
+            final String eventType,
             final PaymentIntent intent,
             final String virtualType,
             final StripeResponsesRecord record,
@@ -513,7 +511,7 @@ public class StripeWebhookServlet {
         }
 
         // CONSTRUCT NOTIFICATION PAYLOAD
-        final Map<String, Object> payload = buildNotificationBody(intent,virtualType,record);
+        final Map<String, Object> payload = buildNotificationBody(eventType, intent, virtualType, record);
 
         // SECURITY: Sign the payload
         final String signingSecret = stripeConfigProperties.getPushNotificationSecret();
@@ -534,26 +532,49 @@ public class StripeWebhookServlet {
      * Mimics the standard Kill Bill push notification structure.
      */
     private Map<String, Object> buildNotificationBody(
+        final String eventType,
         final PaymentIntent intent,
         final String virtualType,
         final StripeResponsesRecord record
     ) {
+        // Get the next action details
         final Map<String, Object> actionDetails = 
             StripeVirtualPaymentMethods.extractNextActionDetails(intent, virtualType);
+        if (actionDetails == null || actionDetails.isEmpty()) {
+            logger.info(
+                "<servlet> no action details for user='{}', virtualType='{}'.",
+                record.getKbAccountId(),
+                virtualType
+            );
+        }
+
+        // Get the invoice id from the intent metadata, if present
+        final Map<String, String> metadata = intent.getMetadata();
+        final String invoiceId = (metadata != null) ? metadata.get("kbInvoiceId") : null;
 
         // Build a payload that mimics the shape of a KillBill push notification
         // so your Django webhook handler needs minimal changes
         final Map<String, Object> payload = new HashMap<>();
-        payload.put("eventType",   "PAYMENT_ACTION_REQUIRED");
+        payload.put("eventType",   "PAYMENT_GATEWAY_UPDATE");
         payload.put("accountId",   record.getKbAccountId());
-        payload.put("objectType",  "PAYMENT");
-        payload.put("objectId",    record.getKbPaymentId());
-        payload.put("metaData",    asJson(Map.of(
-            "paymentTransactionId", record.getKbPaymentTransactionId(),
-            "actionType",           virtualType.toUpperCase(),
-            "actionDetails",        actionDetails,
-            "stripeIntentId",       intent.getId()
-        )));
+        payload.put("objectType",  "TRANSACTION");
+        payload.put("objectId",    record.getKbPaymentTransactionId());
+
+        // Build metadata
+        Map<String, Object> metadataMap = new HashMap<>();
+        metadataMap.put("amount",               intent.getAmount());
+        metadataMap.put("amountReceived",       intent.getAmountReceived());
+        metadataMap.put("paymentStatus",        intent.getStatus());
+        metadataMap.put("paymentDescription",   intent.getStatementDescriptor());
+        metadataMap.put("invoiceId",            invoiceId);
+        metadataMap.put("gatewayEventType",     eventType);
+        metadataMap.put("paymentId",            record.getKbPaymentId());
+        metadataMap.put("paymentMethodType",    virtualType);
+        // Add actionDetails only if not null and not empty
+        if (actionDetails != null  && !actionDetails.isEmpty())
+            metadataMap.put("actionDetails", actionDetails); 
+        metadataMap.put("stripeIntentId",       intent.getId());
+        payload.put("metadata", asJson(metadataMap));
 
         return payload;
     }
