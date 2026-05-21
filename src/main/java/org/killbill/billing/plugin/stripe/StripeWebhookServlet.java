@@ -548,9 +548,10 @@ public class StripeWebhookServlet {
             );
         }
 
-        // Get the invoice id from the intent metadata, if present
+        // Get the invoice id and preferred store from the intent metadata, if present
         final Map<String, String> metadata = intent.getMetadata();
         final String invoiceId = (metadata != null) ? metadata.get("kbInvoiceId") : null;
+        final String preferredStore = (metadata != null) ? metadata.get("store") : null;
 
         // Build a payload that mimics the shape of a KillBill push notification
         // so your Django webhook handler needs minimal changes
@@ -572,8 +573,10 @@ public class StripeWebhookServlet {
         metadataMap.put("paymentMethodType",    virtualType);
         // Add actionDetails only if not null and not empty
         if (actionDetails != null  && !actionDetails.isEmpty())
-            metadataMap.put("actionDetails", actionDetails); 
+            metadataMap.put("actionDetails", actionDetails);
         metadataMap.put("stripeIntentId",       intent.getId());
+        if (preferredStore != null  && !preferredStore.isEmpty())
+            metadataMap.put("preferredStore", preferredStore);
         payload.put("metadata", asJson(metadataMap));
 
         return payload;

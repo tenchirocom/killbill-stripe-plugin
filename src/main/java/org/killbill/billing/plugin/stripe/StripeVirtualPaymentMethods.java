@@ -263,6 +263,35 @@ public final class StripeVirtualPaymentMethods {
     }
 
     /**
+     * Extract the virtual type data from the additional info using the specified virtual
+     * type.
+     *
+     * Called in purchasePayment() to add payment method specific data to the payment
+     * intent metadata.
+     *
+     * @param virtualType The virtual type to use.
+     * @param additionalData Deserialized additional_data map from the DB record.
+     * @return The type key ("konbini", "bank_transfer"), or null.
+     */
+    public static Map<String, String> getVirtualTypeData(String virtualType, final Map<String, Object> additionalData) {
+        if (additionalData == null) {
+            return null;
+        }
+
+        // Initialize the concrete map structure
+        Map<String, String> data = new HashMap<>();
+
+        if ("konbini".equals(virtualType)) {
+            Object storeValue = additionalData.get("store");
+            if (storeValue != null) {
+                data.put("store", String.valueOf(storeValue));
+            }
+        }
+
+        return data;
+    }
+
+    /**
      * Return true if the given type key requires special PaymentIntent handling.
      *
      * This is a guard used in StripePaymentPluginApi.executeInitialTransaction()

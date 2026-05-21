@@ -1248,13 +1248,6 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                         // created in these cases, as the system is awaiting some kind of action. For example
                         // a konbini payment might be waiting for the customer to make payment at the convenient
                         // store.
-                        logger.info("Reusing active pending PaymentIntent for invoice {} (status={})", kbPaymentId, status);
-                        //return buildPaymentTransactionInfoPlugin(existing);
-                        //throw new PaymentPluginApiException(
-                        //    "DUPLICATE_PAYMENT",
-                        //    String.format("An existing Stripe PaymentIntent awaits action for invoice %s.", kbInvoiceId.toString())
-                        //);
-                        // Return an error record instead of throwing an exception
                         return new PluginPaymentTransactionInfoPlugin(
                             kbPaymentId,
                             kbTransactionId,
@@ -1277,12 +1270,6 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                         // This is actually a potentially real case. For example if Stripe has completed the
                         // payment, but this has not yet been synced with Killbill yet, or if there were an
                         // error or misconfiguration in the webhook notifications.
-                        logger.info("Invoice {} already succeeded - returning existing record", kbPaymentId);
-                        //return buildPaymentTransactionInfoPlugin(existing);
-                        //throw new PaymentPluginApiException(
-                        //    "DUPLICATE_PAYMENT",
-                        //    String.format("An existing Stripe PaymentIntent has succeeded for invoice %s.", kbInvoiceId.toString())
-                        //);
                         return new PluginPaymentTransactionInfoPlugin(
                             kbPaymentId,
                             kbTransactionId,
@@ -1536,6 +1523,7 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                         final Map<String, Object> pmAdditionalData =
                                 StripeDao.fromAdditionalData(paymentMethodsRecord.getAdditionalData());
                         final String virtualType = StripeVirtualPaymentMethods.getVirtualType(pmAdditionalData);
+                        final Map<String, String>virtualTypeMetaData = StripeVirtualPaymentMethods.getVirtualTypeData(virtualType, pmAdditionalData);
 
                         // Check currency. These methods are for Japan market only
                         // Verify: Is this strictly true? Are there any other markets/currencies that have these methods too? If so,
@@ -1577,6 +1565,10 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                         if (!Strings.isNullOrEmpty(kbInvoiceId.toString())) {
                             // Only include if it is available
                             metadataBuilder.put("kbInvoiceId", kbInvoiceId.toString());
+                        }
+                        // Safely append all virtual payment method details (Konbini, Bank info, etc.)
+                        if (virtualTypeMetaData != null && !virtualTypeMetaData.isEmpty()) {
+                            metadataBuilder.putAll(virtualTypeMetaData);
                         }
                         paymentIntentParams.put("metadata", metadataBuilder.build());
                         // continue...
