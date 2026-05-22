@@ -54,7 +54,7 @@
  *
  * DESIGN APPROACH
  * ---------------
- * Rather than attempty to adapt the Kill Bill payment method model to include
+ * Rather than attempt to adapt the Kill Bill payment method model to include
  * virtual, transient payment types, a 'virtual' payment type provides a
  * persistent payment method object from which transient types can be created as
  * necessary. Customer information necessary for the creation of these transient
