@@ -1306,8 +1306,10 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
         //    throw ppae;
         } catch (SQLException e) {
             logger.warn("Could not check for existing transaction record", e);
+            throw new PaymentPluginApiException("Database Error: Unable to access existing transactions.", e);
         } catch (final Exception e) {
             logger.warn("Unexpected error during deduplication check", e);
+            throw new PaymentPluginApiException("Internal Error: Unable to verify existing transactions.", e);
         }
 
         logger.info("<plough> CP: No existing...");
@@ -1552,16 +1554,25 @@ public class StripePaymentPluginApi extends PluginPaymentPluginApi<StripeRespons
                         paymentIntentParams.put("currency",          currency.toString());
                         paymentIntentParams.put("capture_method",    captureMethod.value);
                         paymentIntentParams.put("description",       stripeConfigProperties.getChargeDescription());
-                        paymentIntentParams.put("statement_descriptor", stripeConfigProperties.getChargeStatementDescriptor());
+                        if (StripeVirtualPaymentMethods.requiresSpecialHandling(virtualType)) {
+                            // Virtual payment methods (Konbini, Bank Transfer) still use the main statement_descriptor
+                            paymentIntentParams.put("statement_descriptor", stripeConfigProperties.getChargeStatementDescriptor());
+                        } else {
+                            // Credit cards require statement_descriptor_suffix instead
+                            paymentIntentParams.put("statement_descriptor_suffix", stripeConfigProperties.getChargeStatementDescriptor());
+                        }
+
                         // Populate the metadata
                         ImmutableMap.Builder<String, String> metadataBuilder = ImmutableMap.<String, String>builder()
                             // Add basic Kill Bill data to metadata
                             .put("kbAccountId", kbAccountId.toString())
                             .put("kbPaymentId", kbPaymentId.toString())
                             .put("kbTransactionId", kbTransactionId.toString())
-                            .put("kbPaymentMethodId", kbPaymentMethodId.toString())
+                            .put("kbPaymentMethodId", kbPaymentMethodId.toString());
+                        if (virtualType != null) {
                             // Add the virtual type to metadata
-                            .put("type", virtualType);
+                            metadataBuilder.put("type", virtualType);
+                        }
                         if (!Strings.isNullOrEmpty(kbInvoiceId.toString())) {
                             // Only include if it is available
                             metadataBuilder.put("kbInvoiceId", kbInvoiceId.toString());

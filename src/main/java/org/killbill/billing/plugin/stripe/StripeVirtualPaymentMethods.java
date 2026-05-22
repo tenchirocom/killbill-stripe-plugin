@@ -274,7 +274,7 @@ public final class StripeVirtualPaymentMethods {
      * @return The type key ("konbini", "bank_transfer"), or null.
      */
     public static Map<String, String> getVirtualTypeData(String virtualType, final Map<String, Object> additionalData) {
-        if (additionalData == null) {
+        if (additionalData == null || virtualType == null) {
             return null;
         }
 
